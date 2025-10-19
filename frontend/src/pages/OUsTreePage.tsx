@@ -103,7 +103,11 @@ export default function OUsTreePage() {
 
   async function fetchChildren(dn?: string) {
     const url = dn ? `${API}/api/ous/children?parentDn=${encodeURIComponent(dn)}` : `${API}/api/ous/children`;
-    const res = await fetch(url, { headers: { Accept: "application/json", ...auth } });
+    const headers: Record<string, string> = { "Accept": "application/json" };
+    if (auth.Authorization) {
+      headers.Authorization = auth.Authorization;
+    }
+    const res = await fetch(url, { headers });
     if (!res.ok) throw new Error(await res.text());
     return (await res.json()) as { name: string; distinguishedName: string }[];
   }
@@ -112,20 +116,32 @@ export default function OUsTreePage() {
     const qs = new URLSearchParams({ ouDn: dn, take: "200" });
     if (searchTerm) qs.append("search", searchTerm);
     const url = `${API}/api/ous/objects?${qs.toString()}`;
-    const res = await fetch(url, { headers: { Accept: "application/json", ...auth } });
+    const headers: Record<string, string> = { "Accept": "application/json" };
+    if (auth.Authorization) {
+      headers.Authorization = auth.Authorization;
+    }
+    const res = await fetch(url, { headers });
     if (!res.ok) throw new Error(await res.text());
     return (await res.json()) as ADObject[];
   }
 
   async function fetchObjectDetails(dn: string) {
     const url = `${API}/api/ous/object?dn=${encodeURIComponent(dn)}`;
-    const res = await fetch(url, { headers: { Accept: "application/json", ...auth } });
+    const headers: Record<string, string> = { "Accept": "application/json" };
+    if (auth.Authorization) {
+      headers.Authorization = auth.Authorization;
+    }
+    const res = await fetch(url, { headers });
     if (!res.ok) throw new Error(await res.text());
     return (await res.json()) as ADObjectDetails;
   }
 
   async function fetchPolicy() {
-    const res = await fetch(`${API}/api/policy/password`, { headers: { Accept: "application/json", ...auth } });
+    const headers: Record<string, string> = { "Accept": "application/json" };
+    if (auth.Authorization) {
+      headers.Authorization = auth.Authorization;
+    }
+    const res = await fetch(`${API}/api/policy/password`, { headers });
     if (!res.ok) return null;
     const p = await res.json();
     setPolicy(p);
@@ -197,8 +213,12 @@ export default function OUsTreePage() {
     if (!details?.samAccountName) return;
     setDetailsLoading(true); setActionMsg(null);
     try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (auth.Authorization) {
+        headers.Authorization = auth.Authorization;
+      }
       const res = await fetch(`${API}/api/users/set-enabled`, {
-        method: "POST", headers: { "Content-Type": "application/json", ...auth },
+        method: "POST", headers,
         body: JSON.stringify({ samAccountName: details.samAccountName, enabled })
       });
       const data = await res.json();
@@ -215,8 +235,12 @@ export default function OUsTreePage() {
     if (!details?.samAccountName) return;
     setDetailsLoading(true); setActionMsg(null);
     try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (auth.Authorization) {
+        headers.Authorization = auth.Authorization;
+      }
       const res = await fetch(`${API}/api/users/unlock`, {
-        method: "POST", headers: { "Content-Type": "application/json", ...auth },
+        method: "POST", headers,
         body: JSON.stringify({ samAccountName: details.samAccountName })
       });
       const data = await res.json();
@@ -239,9 +263,13 @@ export default function OUsTreePage() {
 
     setResetLoading(true); setActionMsg(null);
     try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (auth.Authorization) {
+        headers.Authorization = auth.Authorization;
+      }
       const res = await fetch(`${API}/api/users/reset-password`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...auth },
+        headers,
         body: JSON.stringify({
           samAccountName: details.samAccountName,
           newPassword: newPass,

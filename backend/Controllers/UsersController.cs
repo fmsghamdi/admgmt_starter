@@ -15,15 +15,36 @@ namespace admgmt_backend.Controllers
             _ad = ad;
         }
 
-        // GET /api/users  (بحث متقدّم)
+        // GET api/users
         [HttpGet]
-        public async Task<IActionResult> GetUsers([FromQuery] UsersQueryOptions options)
+        public async Task<IActionResult> GetUsers([FromQuery] string? q, [FromQuery] string? ouDn,
+            [FromQuery] UserStatusFilter status = UserStatusFilter.Any,
+            [FromQuery] int take = 100, [FromQuery] int skip = 0,
+            [FromQuery] string? sortBy = "displayName", [FromQuery] bool desc = false)
         {
-            var result = await _ad.GetUsersAdvancedAsync(options);
-            return Ok(result);
-        }
+            var opts = new UsersQueryOptions
+            {
+                Q = q,
+                OuDn = ouDn,
+                Status = status,
+                Take = take,
+                Skip = skip,
+                SortBy = sortBy,
+                Desc = desc
+            };
 
-        // GET /api/users/details?sam=...&dn=...
+            var (items, total) = await _ad.GetUsersAdvancedAsync(opts);
+            return Ok(new { items, total });
+        }
+        
+        [HttpGet("ping")]
+public IActionResult Ping()
+{
+    return Ok(new { ok = true, serverTimeUtc = DateTime.UtcNow });
+}
+
+
+        // GET api/users/details?sam=...&dn=...
         [HttpGet("details")]
         public async Task<IActionResult> GetDetails([FromQuery] string? sam, [FromQuery] string? dn)
         {

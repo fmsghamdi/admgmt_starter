@@ -1,54 +1,89 @@
-import React, { useEffect, useMemo, useState, useCallback } from "react";
+// frontend/src/pages/UsersPage.tsx
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Box, Button, Card, CardContent, Chip, FormControl, InputLabel,
-  MenuItem, Select, Stack, TextField, Typography, IconButton
+  Box,
+  Stack,
+  TextField,
+  Button,
+  Typography,
+  IconButton,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
 } from "@mui/material";
-import RefreshIcon from "@mui/icons-material/Refresh";
 import SearchIcon from "@mui/icons-material/Search";
-import InfoIcon from "@mui/icons-material/Info";
-import { DataGrid, GridColDef, GridPaginationModel, GridSortModel } from "@mui/x-data-grid";
+import RefreshIcon from "@mui/icons-material/Refresh";
+import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
+import {
+  DataGrid,
+  GridColDef,
+  GridRenderCellParams,
+  GridPaginationModel,
+  // ملاحظة: لا نستخدم GridValueFormatterParams / GridValueGetterParams
+  // وإن احتجت تايبز: يوجد GridValueFormatter و GridValueGetter في v6
+} from "@mui/x-data-grid";
 import { useSnackbar } from "notistack";
 import UserDetailsModal from "./components/UserDetailsModal";
 
-type ADUserVm = {
+// يضمن إضافة /api حتى لو متغير البيئة ما فيه /api
+const RAW = import.meta.env.VITE_API_URL ?? "http://localhost:5000";
+const API = (RAW.endsWith("/api") ? RAW : RAW.replace(/\/+$/, "") + "/api");
+
+
+/* ================= Types ================= */
+export type ADUserVm = {
   samAccountName: string;
   displayName: string;
-  email: string;
-  enabled: boolean;
-  lastLogon?: string | null;
+  email?: string | null;
+  enabled?: boolean | null;
+  lastLogonUtc?: string | null;
 };
 
-const API = import.meta.env.VITE_API_URL ?? "http://localhost:5000";
+type UsersApiResponse = {
+  items: ADUserVm[];
+  total: number;
+  error?: string;
+};
 
+/* =============== Component =============== */
 export default function UsersPage() {
   const { enqueueSnackbar } = useSnackbar();
 
-  // filters
-  const [q, setQ] = useState<string>("");
+  // البحث والفلاتر
+  const [q, setQ] = useState("");
   const [status, setStatus] = useState<"any" | "enabled" | "disabled" | "locked">("any");
-  const [ouDn, setOuDn] = useState<string>("");
+  const [ouDn, setOuDn] = useState("");
 
-  // grid
+  // الجدول
   const [rows, setRows] = useState<ADUserVm[]>([]);
-  const [rowCount, setRowCount] = useState<number>(0);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [paginationModel, setPaginationModel] = useState<GridPaginationModel>({ page: 0, pageSize: 100 });
-  const [sortModel, setSortModel] = useState<GridSortModel>([{ field: "displayName", sort: "asc" }]);
+  const [rowCount, setRowCount] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [paginationModel, setPaginationModel] = useState<GridPaginationModel>({
+    page: 0,
+    pageSize: 100,
+  });
 
-  // details modal
+  // نافذة التفاصيل
   const [detailsSam, setDetailsSam] = useState<string | null>(null);
 
-  const columns: GridColDef<ADUserVm>[] = useMemo(
+  /* -------- الأعمدة -------- */
+  const columns = useMemo<GridColDef<ADUserVm>[]>(
     () => [
       {
         field: "displayName",
         headerName: "Display Name",
         flex: 1,
         minWidth: 220,
-        renderCell: (p) => (
-          <Stack direction="row" spacing={1} alignItems="center" sx={{ width: "100%" }}>
-            <Typography variant="body2" sx={{ flexGrow: 1 }}>
-              {p.row.displayName || p.row.samAccountName}
+        // لا نستخدم GridValueGetterParams؛ نكتب دالة مباشرة
+        valueGetter: (_value, row) => row.displayName || row.samAccountName || "",
+        renderCell: (p: GridRenderCellParams<ADUserVm, string>) => (
+          <Stack direction="row" alignItems="center" spacing={1} sx={{ width: "100%" }}>
+            <Typography
+              variant="body2"
+              sx={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}
+            >
+              {p.value}
             </Typography>
             <IconButton
               size="small"
@@ -56,153 +91,161 @@ export default function UsersPage() {
                 e.stopPropagation();
                 setDetailsSam(p.row.samAccountName);
               }}
+              title="User details"
             >
-              <InfoIcon fontSize="small" />
+              <InfoOutlinedIcon fontSize="small" />
             </IconButton>
           </Stack>
         ),
       },
-      { field: "samAccountName", headerName: "SAM", minWidth: 140, flex: 0.6 },
+      { field: "samAccountName", headerName: "SAM", flex: 0.7, minWidth: 140 },
       {
         field: "email",
         headerName: "Email",
         flex: 1,
         minWidth: 220,
-        // v7: valueFormatter(value) — لا نستخدم p.value
-        valueFormatter: (value) => (value ? String(value) : "-"),
+        // لا نستخدم GridValueFormatterParams
+        valueFormatter: (value) => (value ?? "-") as string,
       },
       {
         field: "enabled",
         headerName: "Status",
         width: 120,
         type: "boolean",
-        renderCell: (p) => (
-          <Chip
-            label={p.row.enabled ? "enabled" : "disabled"}
-            color={p.row.enabled ? "success" : "warning"}
-            size="small"
-            sx={{ fontWeight: 600 }}
-          />
+        renderCell: (p: GridRenderCellParams<ADUserVm, boolean | null | undefined>) => (
+          <Typography variant="body2">{p.value ? "enabled" : "disabled"}</Typography>
         ),
       },
       {
-        field: "lastLogon",
+        field: "lastLogonUtc",
         headerName: "Last Logon",
-        flex: 1,
-        minWidth: 180,
-        valueFormatter: (value) => (value ? new Date(String(value)).toLocaleString() : "-"),
+        width: 180,
+        valueFormatter: (value) =>
+            value ? new Date(String(value)).toLocaleString() : "-",
       },
     ],
     []
   );
 
-  const runSearch = useCallback(async () => {
-    setLoading(true);
+  /* -------- جلب المستخدمين -------- */
+  const fetchUsers = useCallback(async () => {
     try {
-      const page = paginationModel.page;
-      const pageSize = paginationModel.pageSize;
-      const sortBy = sortModel[0]?.field ?? "displayName";
-      const sortDir = sortModel[0]?.sort ?? "asc";
+      setLoading(true);
 
+      const take = paginationModel.pageSize;
+      const skip = paginationModel.page * paginationModel.pageSize;
+
+      const url = new URL(`${API}/users`);
       const params = new URLSearchParams();
-      if (q) params.set("q", q);
-      if (ouDn) params.set("ouDn", ouDn);
-      if (status === "enabled") params.set("enabled", "true");
-      else if (status === "disabled") params.set("enabled", "false");
-      else if (status === "locked") params.set("locked", "true");
+      if (q.trim()) params.set("q", q.trim());
+      if (ouDn.trim()) params.set("ouDn", ouDn.trim());
+      if (status !== "any") params.set("status", status);
+      params.set("take", String(take));
+      params.set("skip", String(skip));
+      url.search = params.toString();
 
-      params.set("skip", String(page * pageSize));
-      params.set("take", String(pageSize));
-      params.set("sortBy", sortBy);
-      params.set("sortDir", sortDir);
-
-      const res = await fetch(`${API}/api/users?${params.toString()}`, {
-        headers: { Accept: "application/json" },
-        credentials: "include",
-      });
+      const res = await fetch(url.toString(), { headers: { Accept: "application/json" } });
       if (!res.ok) throw new Error(`API ${res.status}`);
 
-      const data = await res.json(); // { items, total }
-      setRows(Array.isArray(data.items) ? data.items : []);
-      setRowCount(Number(data.total) || 0);
+      const data: UsersApiResponse = await res.json();
+      const items = Array.isArray(data.items) ? data.items : [];
+      const total = Number.isFinite(data.total) ? data.total : items.length;
+
+      setRows(items);
+      setRowCount(total);
     } catch (err: any) {
+      console.error(err);
       enqueueSnackbar(`Failed to load users: ${err.message ?? err}`, { variant: "error" });
       setRows([]);
       setRowCount(0);
     } finally {
       setLoading(false);
     }
-  }, [API, q, ouDn, status, paginationModel, sortModel, enqueueSnackbar]);
+  }, [API, q, ouDn, status, paginationModel.page, paginationModel.pageSize, enqueueSnackbar]);
 
   useEffect(() => {
-    runSearch();
-  }, [runSearch]);
+    fetchUsers();
+  }, [fetchUsers]);
 
+  const onSearchClick = () => {
+    setPaginationModel((prev) => ({ ...prev, page: 0 }));
+    fetchUsers();
+  };
+
+  const onRefresh = () => fetchUsers();
+
+  /* --------------- الواجهة --------------- */
   return (
     <Box sx={{ p: 2 }}>
-      <Card variant="outlined">
-        <CardContent>
-          <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 2, flexWrap: "wrap" }}>
-            <TextField
-              size="small"
-              fullWidth
-              label="Search users (displayName / SAM / email)"
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && runSearch()}
-            />
-            <FormControl size="small" sx={{ minWidth: 160 }}>
-              <InputLabel>Status</InputLabel>
-              <Select label="Status" value={status} onChange={(e) => setStatus(e.target.value as any)}>
-                <MenuItem value="any">Any</MenuItem>
-                <MenuItem value="enabled">Enabled</MenuItem>
-                <MenuItem value="disabled">Disabled</MenuItem>
-                <MenuItem value="locked">Locked</MenuItem>
-              </Select>
-            </FormControl>
-            <TextField
-              size="small"
-              label="OU DN (optional)"
-              value={ouDn}
-              onChange={(e) => setOuDn(e.target.value)}
-              sx={{ minWidth: 320 }}
-              placeholder="OU=Colleges,DC=UQU,DC=LOCAL"
-            />
-            <Button
-              variant="contained"
-              startIcon={<SearchIcon />}
-              onClick={() => {
-                // رجّع للصفحة الأولى عند تغيير الفلاتر
-                setPaginationModel((m) => ({ ...m, page: 0 }));
-                runSearch();
-              }}
-            >
-              Search
-            </Button>
-            <IconButton onClick={runSearch}><RefreshIcon /></IconButton>
-          </Stack>
+      {/* البحث */}
+      <Stack
+        direction={{ xs: "column", md: "row" }}
+        spacing={2}
+        alignItems={{ xs: "stretch", md: "center" }}
+        sx={{ mb: 2 }}
+      >
+        <TextField
+          label="Search users (displayName / SAM / email)"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          fullWidth
+          size="small"
+        />
 
-          <div style={{ height: 560, width: "100%" }}>
-            <DataGrid<ADUserVm>
-              rows={rows}
-              getRowId={(r) => r.samAccountName}
-              columns={columns}
-              rowCount={rowCount}
-              loading={loading}
-              paginationMode="server"
-              sortingMode="server"
-              paginationModel={paginationModel}
-              onPaginationModelChange={setPaginationModel}
-              sortModel={sortModel}
-              onSortModelChange={setSortModel}
-              disableRowSelectionOnClick
-              onRowDoubleClick={(p) => setDetailsSam(p.row.samAccountName)}
-            />
-          </div>
-        </CardContent>
-      </Card>
+        <FormControl size="small" sx={{ minWidth: 160 }}>
+          <InputLabel>Status</InputLabel>
+          <Select
+            label="Status"
+            value={status}
+            onChange={(e) => setStatus(e.target.value as any)}
+          >
+            <MenuItem value="any">Any</MenuItem>
+            <MenuItem value="enabled">Enabled</MenuItem>
+            <MenuItem value="disabled">Disabled</MenuItem>
+            <MenuItem value="locked">Locked</MenuItem>
+          </Select>
+        </FormControl>
 
-      <UserDetailsModal sam={detailsSam} onClose={() => setDetailsSam(null)} />
+        <TextField
+          label="OU DN (optional)"
+          value={ouDn}
+          onChange={(e) => setOuDn(e.target.value)}
+          size="small"
+          sx={{ minWidth: 260 }}
+        />
+
+        <Button variant="contained" startIcon={<SearchIcon />} onClick={onSearchClick} sx={{ minWidth: 140 }}>
+          SEARCH
+        </Button>
+
+        <IconButton onClick={onRefresh} title="Refresh">
+          <RefreshIcon />
+        </IconButton>
+      </Stack>
+
+      {/* الجدول */}
+      <Box sx={{ height: 560 }}>
+        <DataGrid
+          columns={columns}
+          rows={rows}
+          loading={loading}
+          getRowId={(r) => r.samAccountName}
+          paginationMode="server"
+          rowCount={rowCount}
+          paginationModel={paginationModel}
+          onPaginationModelChange={setPaginationModel}
+          pageSizeOptions={[25, 50, 100, 200]}
+          disableRowSelectionOnClick
+          density="compact"
+        />
+      </Box>
+
+      {/* نافذة التفاصيل */}
+      <UserDetailsModal
+        open={!!detailsSam}
+        sam={detailsSam ?? ""}
+        onClose={() => setDetailsSam(null)}
+      />
     </Box>
   );
 }

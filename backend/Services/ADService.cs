@@ -1,13 +1,14 @@
 using System.DirectoryServices;
 using System.DirectoryServices.AccountManagement;
+using System.Runtime.Versioning;
 using System.Text.RegularExpressions;
 using admgmt_backend.ViewModels;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using System.Linq;
 
 namespace admgmt_backend.Services
 {
+    [SupportedOSPlatform("windows")]
     public class ADService : IADService
     {
         private readonly IConfiguration _cfg;
@@ -74,8 +75,8 @@ namespace admgmt_backend.Services
                 Filter = filter,
                 SearchScope = scope,
                 PageSize = 500,
-                ClientTimeout = TimeSpan.FromSeconds(8),
-                ServerTimeLimit = TimeSpan.FromSeconds(8),
+                ClientTimeout = TimeSpan.FromSeconds(20),
+                ServerTimeLimit = TimeSpan.FromSeconds(20),
                 ReferralChasing = ReferralChasingOption.None
             };
             foreach (var p in props) ds.PropertiesToLoad.Add(p);
@@ -108,7 +109,7 @@ namespace admgmt_backend.Services
             return "other";
         }
 
-        // ===== Users (قديم) =====
+        // ===== Users (بسيط) =====
         public async Task<List<ADUserVm>> GetUsersAsync(string? search = null, int take = 100, int skip = 0)
         {
             return await Task.Run(() =>
@@ -120,8 +121,8 @@ namespace admgmt_backend.Services
 
                 using var ps = new PrincipalSearcher(q);
                 return ps.FindAll()
-                    .Skip(skip).Take(take)
                     .OfType<UserPrincipal>()
+                    .Skip(skip).Take(take)
                     .Select(u => new ADUserVm
                     {
                         SamAccountName = u.SamAccountName ?? "",
@@ -186,14 +187,10 @@ namespace admgmt_backend.Services
                 user.SetPassword(newPassword);
 
                 if (forceChangeAtNextLogon)
-                {
                     user.ExpirePasswordNow();
-                }
 
                 if (unlockIfLocked && user.IsAccountLockedOut())
-                {
                     user.UnlockAccount();
-                }
 
                 user.Save();
                 return true;
@@ -213,157 +210,213 @@ namespace admgmt_backend.Services
             });
         }
 
-        // ===== Users (جديد) =====
-        public async Task<PagedResult<ADUserVm>> GetUsersAdvancedAsync(UsersQueryOptions options)
+        // ===== Users (متقدم) =====
+        public async Task<(List<ADUserVm> Items, int Total)> GetUsersAdvancedAsync(UsersQueryOptions opts)
         {
             return await Task.Run(() =>
             {
-                var baseDn = string.IsNullOrWhiteSpace(options.OuDn) ? GetDefaultNamingContext() : options.OuDn!;
-                var clauses = new List<string>();
-
-                // Users فقط
-                clauses.Add("(&(objectCategory=person)(objectClass=user))");
-
-                // نص البحث
-                if (!string.IsNullOrWhiteSpace(options.Q))
+                string baseDn = string.IsNullOrWhiteSpace(opts.OuDn) ? GetDefaultNamingContext() : opts.OuDn!;
+                var parts = new List<string>
                 {
-                    string q = options.Q.Replace(")", "").Replace("(", "");
-                    clauses.Add($"(|(displayName=*{q}*)(sAMAccountName=*{q}*)(mail=*{q}*))");
+                    "(&(objectCategory=person)(objectClass=user))"
+                };
+
+                if (!string.IsNullOrWhiteSpace(opts.Q))
+                {
+                    var q = opts.Q!.Replace(")", "").Replace("(", "");
+                    parts.Add($"(|(displayName=*{q}*)(sAMAccountName=*{q}*)(mail=*{q}*))");
                 }
 
-                // حالة Enabled/Disabled
-                if (!string.IsNullOrWhiteSpace(options.Status))
+                switch (opts.Status)
                 {
-                    var st = options.Status!.ToLowerInvariant();
-                    if (st == "enabled")
-                        clauses.Add("(!(userAccountControl:1.2.840.113556.1.4.803:=2))"); // NOT disabled
-                    else if (st == "disabled")
-                        clauses.Add("(userAccountControl:1.2.840.113556.1.4.803:=2)");
-                    // locked سنتحقق بها لاحقاً (بحاجة Context)، لذلك نترك LDAP عام
+                    case UserStatusFilter.Enabled:
+                        parts.Add("(!(userAccountControl:1.2.840.113556.1.4.803:=2))"); // NOT disabled
+                        break;
+                    case UserStatusFilter.Disabled:
+                        parts.Add("(userAccountControl:1.2.840.113556.1.4.803:=2)"); // disabled
+                        break;
+                    case UserStatusFilter.Locked:
+                        // لا يوجد فلتر LDAP مباشر للـ lock؛ سنفلتر لاحقًا عبر Principal إذا احتجنا.
+                        break;
                 }
 
-                string filter = $"(&{string.Join("", clauses)})";
+                string filter = $"(&{string.Join("", parts)})";
 
-                using var ds = MakeSearcher(
-                    baseDn,
-                    string.IsNullOrWhiteSpace(options.OuDn) ? SearchScope.Subtree : SearchScope.OneLevel,
-                    filter,
-                    new[] { "displayName", "mail", "sAMAccountName", "userAccountControl", "distinguishedName", "lastLogonTimestamp" }
-                );
+                var props = new[] {
+                    "displayName","sAMAccountName","mail","userAccountControl","lastLogonTimestamp","lastLogon","distinguishedName"
+                };
 
-                var all = new List<ADUserVm>();
-                foreach (SearchResult r in ds.FindAll())
-                {
-                    var sam = r.Properties["sAMAccountName"]?.Count > 0 ? r.Properties["sAMAccountName"][0]?.ToString() ?? "" : "";
-                    var display = r.Properties["displayName"]?.Count > 0 ? r.Properties["displayName"][0]?.ToString() ?? "" : "";
-                    var mail = r.Properties["mail"]?.Count > 0 ? r.Properties["mail"][0]?.ToString() ?? "" : "";
-                    bool enabled = true;
-                    if (r.Properties["userAccountControl"]?.Count > 0)
-                    {
-                        var uac = Convert.ToInt32(r.Properties["userAccountControl"][0]);
-                        enabled = !IsDisabledUac(uac);
-                    }
+                using var ds = MakeSearcher(baseDn, SearchScope.Subtree, filter, props);
 
-                    all.Add(new ADUserVm
-                    {
-                        SamAccountName = sam,
-                        DisplayName = display,
-                        Email = mail,
-                        Enabled = enabled
-                    });
-                }
+                // جلب النتائج (سنحسب الإجمالي بعد الفلترة الإضافية)
+                var all = ds.FindAll().Cast<SearchResult>().ToList();
 
-                // locked؟ نتأكد بها لو طلبها
-                if (options.Status?.ToLowerInvariant() == "locked")
+                // فلترة lock إن طلب
+                IEnumerable<SearchResult> filtered = all;
+                if (opts.Status == UserStatusFilter.Locked)
                 {
                     using var ctx = CreateContext();
-                    all = all.Where(u =>
+                    filtered = all.Where(r =>
                     {
-                        try
-                        {
-                            var up = UserPrincipal.FindByIdentity(ctx, u.SamAccountName);
-                            return up != null && up.IsAccountLockedOut();
-                        }
-                        catch { return false; }
+                        var dn = r.Properties["distinguishedName"]?.Count > 0 ? r.Properties["distinguishedName"][0]?.ToString() : null;
+                        if (string.IsNullOrWhiteSpace(dn)) return false;
+                        var up = UserPrincipal.FindByIdentity(ctx, IdentityType.DistinguishedName, dn!);
+                        return (up?.IsAccountLockedOut() ?? false);
                     }).ToList();
                 }
 
-                var total = all.Count;
-                var paged = all.Skip(options.Skip).Take(options.Take).ToList();
-
-                return new PagedResult<ADUserVm>
+                // فرز
+                Func<SearchResult, object?> keySel = r =>
                 {
-                    Items = paged,
-                    Total = total
+                    object? v = null;
+                    var s = (opts.SortBy ?? "displayName").ToLowerInvariant();
+                    if (s is "sam" or "sAMAccountName") s = "sAMAccountName";
+                    if (s == "sam") s = "sAMAccountName";
+                    switch (s)
+                    {
+                        case "displayname": v = r.Properties["displayName"]?.Count > 0 ? r.Properties["displayName"][0] : null; break;
+                        case "sam":
+                        case "samaccountname": v = r.Properties["sAMAccountName"]?.Count > 0 ? r.Properties["sAMAccountName"][0] : null; break;
+                        case "email":
+                            v = r.Properties["mail"]?.Count > 0 ? r.Properties["mail"][0] : null; break;
+                        case "lastlogon":
+                            v = ReadFileTimeUtc(r.Properties["lastLogonTimestamp"]?.Count > 0 ? r.Properties["lastLogonTimestamp"][0] : null)
+                                ?? ReadFileTimeUtc(r.Properties["lastLogon"]?.Count > 0 ? r.Properties["lastLogon"][0] : null);
+                            break;
+                        default:
+                            v = r.Properties["displayName"]?.Count > 0 ? r.Properties["displayName"][0] : null;
+                            break;
+                    }
+                    return v;
                 };
+
+                filtered = opts.Desc ? filtered.OrderByDescending(keySel) : filtered.OrderBy(keySel);
+
+                var total = filtered.Count();
+
+                var page = filtered.Skip(opts.Skip).Take(opts.Take)
+                    .Select(r =>
+                    {
+                        string sam = r.Properties["sAMAccountName"]?.Count > 0 ? r.Properties["sAMAccountName"][0]?.ToString() ?? "" : "";
+                        string disp = r.Properties["displayName"]?.Count > 0 ? r.Properties["displayName"][0]?.ToString() ?? "" : "";
+                        string? mail = r.Properties["mail"]?.Count > 0 ? r.Properties["mail"][0]?.ToString() : null;
+                        bool? enabled = null;
+                        if (r.Properties["userAccountControl"]?.Count > 0)
+                        {
+                            int uac = Convert.ToInt32(r.Properties["userAccountControl"][0]);
+                            enabled = !IsDisabledUac(uac);
+                        }
+
+                        return new ADUserVm
+                        {
+                            SamAccountName = sam,
+                            DisplayName = disp,
+                            Email = mail ?? "",
+                            Enabled = enabled ?? true
+                        };
+                    }).ToList();
+
+                return (page, total);
             });
         }
 
-        public async Task<ADObjectDetailsVm?> GetUserDetailsAsync(string? sam, string? dn)
+        public async Task<ADObjectDetailsVm?> GetUserDetailsAsync(string? sam = null, string? dn = null)
         {
             return await Task.Run(() =>
             {
-                using var ctx = CreateContext();
-                UserPrincipal? up = null;
-                DirectoryEntry? de = null;
+                string? dn2 = dn;
 
-                if (!string.IsNullOrWhiteSpace(dn))
+                if (string.IsNullOrWhiteSpace(dn2) && !string.IsNullOrWhiteSpace(sam))
                 {
-                    de = new DirectoryEntry(BuildPath(dn), _cfg["AD:ServiceUserUPN"], _cfg["AD:ServicePassword"]);
-                    up = UserPrincipal.FindByIdentity(ctx, IdentityType.DistinguishedName, dn);
-                }
-                else if (!string.IsNullOrWhiteSpace(sam))
-                {
-                    up = UserPrincipal.FindByIdentity(ctx, sam);
-                    if (up != null)
-                        de = up.GetUnderlyingObject() as DirectoryEntry;
+                    using var ctx = CreateContext();
+                    var up = UserPrincipal.FindByIdentity(ctx, sam!);
+                    if (up == null) return null;
+                    var de = up.GetUnderlyingObject() as DirectoryEntry;
+                    dn2 = de?.Properties["distinguishedName"]?.Value?.ToString();
                 }
 
-                if (up == null || de == null) return null;
+                if (string.IsNullOrWhiteSpace(dn2)) return null;
 
-                // خصائص إضافية
-                var lastLogonTimestamp = de.Properties["lastLogonTimestamp"]?.Value;
-                var pwdLastSet = de.Properties["pwdLastSet"]?.Value;
-                var accExpires = de.Properties["accountExpires"]?.Value;
-
-                DateTime? lastLogonUtc = ReadFileTimeUtc(lastLogonTimestamp);
-                DateTime? pwdLastSetUtc = ReadFileTimeUtc(pwdLastSet);
-                DateTime? accExpiresUtc = ReadFileTimeUtc(accExpires);
-
-                var dn2 = de.Properties["distinguishedName"]?.Value?.ToString() ?? "";
-                var mail = de.Properties["mail"]?.Value?.ToString();
-                var uac = de.Properties["userAccountControl"]?.Value is int v ? v : 0;
-                bool enabled = (uac & 2) != 2;
-
-                // المجموعات
-                var groups = new List<string>();
-                try
+                using var entry = new DirectoryEntry(BuildPath(dn2), _cfg["AD:ServiceUserUPN"], _cfg["AD:ServicePassword"]);
+                using var ds = new DirectorySearcher(entry)
                 {
-                    foreach (var g in up.GetGroups())
-                    {
-                        if (g is GroupPrincipal gp)
-                            groups.Add(gp.SamAccountName ?? gp.Name ?? "");
-                    }
+                    SearchScope = SearchScope.Base,
+                    Filter = "(objectClass=*)",
+                    ClientTimeout = TimeSpan.FromSeconds(20),
+                    ServerTimeLimit = TimeSpan.FromSeconds(20),
+                    ReferralChasing = ReferralChasingOption.None
+                };
+                ds.PropertiesToLoad.AddRange(new[]
+                {
+                    "name","distinguishedName","sAMAccountName","objectClass",
+                    "mail","userAccountControl","lastLogonTimestamp","lastLogon",
+                    "pwdLastSet","accountExpires"
+                });
+
+                var res = ds.FindOne();
+                if (res == null) return null;
+
+                string name = res.Properties["name"]?.Count > 0 ? res.Properties["name"][0]?.ToString() ?? "" : "";
+                string dn3  = res.Properties["distinguishedName"]?.Count > 0 ? res.Properties["distinguishedName"][0]?.ToString() ?? "" : "";
+                string? sam2 = res.Properties["sAMAccountName"]?.Count > 0 ? res.Properties["sAMAccountName"][0]?.ToString() : null;
+                string oc   = ClassFromResult(res);
+                string? mail = res.Properties["mail"]?.Count > 0 ? res.Properties["mail"][0]?.ToString() : null;
+
+                bool? enabled = null;
+                if (res.Properties["userAccountControl"]?.Count > 0)
+                {
+                    int uac = Convert.ToInt32(res.Properties["userAccountControl"][0]);
+                    enabled = !IsDisabledUac(uac);
                 }
-                catch { }
+
+                DateTime? lastLogon = ReadFileTimeUtc(res.Properties["lastLogonTimestamp"]?.Count > 0 ? res.Properties["lastLogonTimestamp"][0] : null)
+                                      ?? ReadFileTimeUtc(res.Properties["lastLogon"]?.Count > 0 ? res.Properties["lastLogon"][0] : null);
+
+                // pwdLastSet / accountExpires
+                DateTime? pwdLastSetUtc = ReadFileTimeUtc(res.Properties["pwdLastSet"]?.Count > 0 ? res.Properties["pwdLastSet"][0] : null);
+                DateTime? accExpiresUtc = ReadFileTimeUtc(res.Properties["accountExpires"]?.Count > 0 ? res.Properties["accountExpires"][0] : null);
 
                 bool? locked = null;
-                try { locked = up.IsAccountLockedOut(); } catch { }
+                if (oc == "user" && !string.IsNullOrWhiteSpace(dn3))
+                {
+                    using var ctx = CreateContext();
+                    var up = UserPrincipal.FindByIdentity(ctx, IdentityType.DistinguishedName, dn3);
+                    if (up != null) locked = up.IsAccountLockedOut();
+                }
+
+                // Groups
+                var groups = new List<string>();
+                if (!string.IsNullOrWhiteSpace(sam2))
+                {
+                    using var ctx = CreateContext();
+                    var up = UserPrincipal.FindByIdentity(ctx, sam2);
+                    if (up != null)
+                    {
+                        try
+                        {
+                            foreach (var g in up.GetAuthorizationGroups())
+                            {
+                                try { groups.Add(g.Name); } catch { /* ignore */ }
+                            }
+                        }
+                        catch { /* بعض الدومينات ترمي استثناء هنا */ }
+                    }
+                }
 
                 var vm = new ADObjectDetailsVm
                 {
-                    Name = up.DisplayName ?? up.SamAccountName ?? "",
-                    DistinguishedName = dn2,
-                    SamAccountName = up.SamAccountName ?? "",
-                    ObjectClass = "user",
+                    Name = name,
+                    DistinguishedName = dn3,
+                    SamAccountName = sam2,
+                    ObjectClass = oc,
                     Email = mail,
                     Enabled = enabled,
                     Locked = locked,
-                    LastLogonUtc = lastLogonUtc
+                    LastLogonUtc = lastLogon
                 };
 
-                // قيم إضافية للـ Modal
-                vm.Extra["parentDn"] = GetParentDn(dn2);
+                // Extra (أنواعها غير نصية — ما في تحويل)
+                vm.Extra["parentDn"] = GetParentDn(dn3);
                 vm.Extra["passwordLastSetUtc"] = pwdLastSetUtc;
                 vm.Extra["accountExpiresUtc"] = accExpiresUtc;
                 vm.Extra["groups"] = groups;
@@ -525,68 +578,10 @@ namespace admgmt_backend.Services
             });
         }
 
-        // ===== Object details =====
+        // ===== Object details (عام) =====
         public async Task<ADObjectDetailsVm?> GetObjectDetailsAsync(string dn)
         {
-            return await Task.Run(() =>
-            {
-                using var entry = new DirectoryEntry(BuildPath(dn), _cfg["AD:ServiceUserUPN"], _cfg["AD:ServicePassword"]);
-                using var ds = new DirectorySearcher(entry)
-                {
-                    SearchScope = SearchScope.Base,
-                    Filter = "(objectClass=*)",
-                    ClientTimeout = TimeSpan.FromSeconds(6),
-                    ServerTimeLimit = TimeSpan.FromSeconds(6),
-                    ReferralChasing = ReferralChasingOption.None
-                };
-                ds.PropertiesToLoad.AddRange(new[]
-                {
-                    "name", "distinguishedName", "sAMAccountName", "objectClass",
-                    "mail", "userAccountControl", "lastLogonTimestamp", "lastLogon"
-                });
-
-                var res = ds.FindOne();
-                if (res == null) return null;
-
-                string name = res.Properties["name"]?.Count > 0 ? res.Properties["name"][0]?.ToString() ?? "" : "";
-                string dn2  = res.Properties["distinguishedName"]?.Count > 0 ? res.Properties["distinguishedName"][0]?.ToString() ?? "" : "";
-                string? sam = res.Properties["sAMAccountName"]?.Count > 0 ? res.Properties["sAMAccountName"][0]?.ToString() : null;
-                string oc   = ClassFromResult(res);
-                string? mail= res.Properties["mail"]?.Count > 0 ? res.Properties["mail"][0]?.ToString() : null;
-
-                bool? enabled = null;
-                if (res.Properties["userAccountControl"]?.Count > 0)
-                {
-                    int uac = Convert.ToInt32(res.Properties["userAccountControl"][0]);
-                    enabled = !IsDisabledUac(uac);
-                }
-
-                DateTime? lastLogon = ReadFileTimeUtc(res.Properties["lastLogonTimestamp"]?.Count > 0 ? res.Properties["lastLogonTimestamp"][0] : null)
-                                      ?? ReadFileTimeUtc(res.Properties["lastLogon"]?.Count > 0 ? res.Properties["lastLogon"][0] : null);
-
-                bool? locked = null;
-                if (oc == "user" && !string.IsNullOrWhiteSpace(sam))
-                {
-                    using var ctx = CreateContext();
-                    var up = UserPrincipal.FindByIdentity(ctx, IdentityType.DistinguishedName, dn2);
-                    if (up != null) locked = up.IsAccountLockedOut();
-                }
-
-                var vm = new ADObjectDetailsVm
-                {
-                    Name = name,
-                    DistinguishedName = dn2,
-                    SamAccountName = sam,
-                    ObjectClass = oc,
-                    Email = mail,
-                    Enabled = enabled,
-                    Locked = locked,
-                    LastLogonUtc = lastLogon
-                };
-
-                vm.Extra["parentDn"] = GetParentDn(dn2);
-                return vm;
-            });
+            return await GetUserDetailsAsync(null, dn);
         }
 
         // ===== Mutations for OU =====
