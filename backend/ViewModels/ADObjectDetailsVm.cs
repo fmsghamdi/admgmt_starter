@@ -5,6 +5,9 @@ namespace admgmt_backend.ViewModels
     public class ADObjectDetailsVm
     {
         public string Name { get; set; } = "";
+         public string DisplayName { get; set; } = "";
+         public string Type { get; set; } = "";
+         public Dictionary<string, string?> Properties { get; set; } = new();
         public string DistinguishedName { get; set; } = "";
         public string? SamAccountName { get; set; }
         public string ObjectClass { get; set; } = "other";

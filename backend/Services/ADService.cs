@@ -1,636 +1,722 @@
+using System;
+using System.Collections.Generic;
 using System.DirectoryServices;
 using System.DirectoryServices.AccountManagement;
-using System.Runtime.Versioning;
-using System.Text.RegularExpressions;
-using admgmt_backend.ViewModels;
+using System.Linq;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using admgmt_backend.ViewModels;
 
 namespace admgmt_backend.Services
 {
-    [SupportedOSPlatform("windows")]
+    // ملاحظة مهمة:
+    // لا تضع تعريف الواجهة هنا. IADService موجود في IADService.cs
+    // هذا الملف يحتوي فقط على التطبيق (implementation).
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     public class ADService : IADService
     {
-        private readonly IConfiguration _cfg;
-        private readonly ILogger<ADService> _logger;
+        private readonly ILogger<ADService> _log;
+        private readonly IConfiguration _config;
 
-        public ADService(IConfiguration cfg, ILogger<ADService> logger)
+        // إعدادات AD من appsettings.json (عدّل المفاتيح لتطابق الموجود عندك)
+        private readonly string _ldapPath;
+        private readonly string? _bindUser;
+        private readonly string? _bindPassword;
+        private readonly TimeSpan _searchTimeout;
+
+        public ADService(ILogger<ADService> log, IConfiguration config)
         {
-            _cfg = cfg;
-            _logger = logger;
+            _log = log;
+            _config = config;
+
+            _ldapPath = _config["AD:LdapPath"] ?? "LDAP:///";
+            _bindUser = _config["AD:ServiceUserUPN"];
+            _bindPassword = _config["AD:ServicePassword"];
+
+            var timeoutSec = _config.GetValue<int?>("AD:SearchTimeoutSeconds") ?? 30;
+            _searchTimeout = TimeSpan.FromSeconds(timeoutSec);
         }
 
-        // ===== Helpers =====
-        private string GetHostFromConfig()
-        {
-            var path = _cfg["AD:LdapPath"] ?? "";
-            var m = Regex.Match(path, @"^LDAPS?://([^/]+)", RegexOptions.IgnoreCase);
-            if (m.Success) return m.Groups[1].Value.Trim();
-            if (!string.IsNullOrWhiteSpace(path)) return path.Trim();
-            return _cfg["AD:Domain"] ?? "";
-        }
+        #region ===== Users =====
 
-        private string BuildPath(string relative)
-        {
-            var useLdaps = (_cfg["AD:UseLdaps"] ?? "false").Equals("true", StringComparison.OrdinalIgnoreCase);
-            var scheme = useLdaps ? "LDAPS" : "LDAP";
-            var host = GetHostFromConfig();
-            relative = relative?.TrimStart('/') ?? "";
-            return $"{scheme}://{host}/{relative}";
-        }
-
-        private PrincipalContext CreateContext()
-        {
-            var user = _cfg["AD:ServiceUserUPN"];
-            var pass = _cfg["AD:ServicePassword"];
-            var host = GetHostFromConfig();
-            _logger.LogInformation("CreateContext: Server={Server}, User={User}", host, user);
-            return new PrincipalContext(ContextType.Domain, host, null, ContextOptions.Negotiate, user, pass);
-        }
-
-        private string GetDefaultNamingContext()
-        {
-            using var root = new DirectoryEntry(BuildPath("RootDSE"), _cfg["AD:ServiceUserUPN"], _cfg["AD:ServicePassword"]);
-            var dn = root.Properties["defaultNamingContext"]?.Value?.ToString();
-            return string.IsNullOrWhiteSpace(dn) ? (_cfg["AD:DefaultContainer"] ?? "") : dn!;
-        }
-
-        private static string? GetParentDn(string dn)
-        {
-            var i = dn.IndexOf(',');
-            return i > 0 ? dn[(i + 1)..] : null;
-        }
-
-        private DirectorySearcher MakeSearcher(string baseDn, SearchScope scope, string filter, string[] props)
-        {
-            var entry = new DirectoryEntry(
-                BuildPath(baseDn),
-                _cfg["AD:ServiceUserUPN"],
-                _cfg["AD:ServicePassword"],
-                AuthenticationTypes.Secure
-            );
-
-            var ds = new DirectorySearcher(entry)
-            {
-                Filter = filter,
-                SearchScope = scope,
-                PageSize = 500,
-                ClientTimeout = TimeSpan.FromSeconds(20),
-                ServerTimeLimit = TimeSpan.FromSeconds(20),
-                ReferralChasing = ReferralChasingOption.None
-            };
-            foreach (var p in props) ds.PropertiesToLoad.Add(p);
-            return ds;
-        }
-
-        private static bool IsDisabledUac(int uac) => (uac & 0x2) == 0x2;
-
-        private static DateTime? ReadFileTimeUtc(object? raw)
+        public async Task<(List<ADUserVm> Items, int Total)> GetUsersAdvancedAsync(UsersQueryOptions opts)
         {
             try
             {
-                if (raw == null) return null;
-                long v = raw is long l ? l : Convert.ToInt64(raw);
-                if (v <= 0) return null;
-                return DateTime.FromFileTimeUtc(v);
+                opts ??= new UsersQueryOptions();
+                var q = (opts.Q ?? "").Trim();
+                var take = opts.Take <= 0 ? 50 : Math.Min(opts.Take, 500);
+                var skip = Math.Max(0, opts.Skip);
+
+                string? ouDn = null;
+                try
+                {
+                    var ouProp = typeof(UsersQueryOptions).GetProperty("OUdn",
+                        System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.Instance |
+                        System.Reflection.BindingFlags.IgnoreCase);
+
+                    if (ouProp != null)
+                    {
+                        ouDn = ouProp.GetValue(opts) as string;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Failed to get OUdn property");
+                }
+
+                ouDn = (ouDn ?? "").Trim();
+
+            return await Task.Run(() =>
+            {
+                try 
+                {
+                    using var entry = string.IsNullOrWhiteSpace(ouDn)
+                        ? MakeDirectoryEntry(_ldapPath)
+                        : MakeDirectoryEntry($"LDAP://{ouDn}");
+
+                    using var searcher = new DirectorySearcher(entry)
+                    {
+                        PageSize = 100,
+                        SizeLimit = take + skip,
+                        SearchScope = SearchScope.Subtree,
+                        CacheResults = true,
+                        ClientTimeout = _searchTimeout,
+                        ServerTimeLimit = _searchTimeout,
+                        ServerPageTimeLimit = TimeSpan.FromSeconds(5)
+                    };
+
+                    // Build filter
+                    var filterParts = new List<string> { "(objectCategory=person)", "(objectClass=user)" };
+
+                    // Handle enabled/disabled status
+                    if (opts.Status == UserStatusFilter.Enabled)
+                    {
+                        filterParts.Add("(!(userAccountControl:1.2.840.113556.1.4.803:=2))");
+                    }
+                    else if (opts.Status == UserStatusFilter.Disabled)
+                    {
+                        filterParts.Add("(userAccountControl:1.2.840.113556.1.4.803:=2)");
+                    }
+
+                    // Handle search text
+                    if (!string.IsNullOrWhiteSpace(q))
+                    {
+                        var esc = EscapeLdap(q);
+                        filterParts.Add($"(|(displayName=*{esc}*)(sAMAccountName=*{esc}*)(mail=*{esc}*)(cn=*{esc}*))");
+                    }
+
+                    searcher.Filter = "(&" + string.Join("", filterParts) + ")";
+
+                    // Request specific properties
+                    searcher.PropertiesToLoad.Clear();
+                    searcher.PropertiesToLoad.AddRange(new[]
+                    {
+                        "displayName",
+                        "sAMAccountName",
+                        "distinguishedName",
+                        "mail",
+                        "userAccountControl",
+                        "lastLogonTimestamp",
+                        "cn",
+                        "whenCreated",
+                        "pwdLastSet"
+                    });
+
+                    var results = searcher.FindAll().Cast<SearchResult>().ToList();
+                    var total = results.Count;
+
+                    // Handle sorting
+                    var sortBy = (opts.SortBy ?? "displayName").ToLowerInvariant();
+                    var desc = opts.Desc;
+
+                    Func<SearchResult, object?> keySel = sortBy switch
+                    {
+                        "sam" or "samaccountname" => s => GetProp<string>(s, "sAMAccountName"),
+                        "email" or "mail" => s => GetProp<string>(s, "mail"),
+                        "lastlogon" or "lastlogonutc" => s => ToDate(GetProp<long?>(s, "lastLogonTimestamp")),
+                        _ => s => GetProp<string>(s, "displayName") ?? GetProp<string>(s, "cn") ?? GetProp<string>(s, "sAMAccountName") ?? ""
+                    };
+
+                    var ordered = desc ? results.OrderByDescending(keySel) : results.OrderBy(keySel);
+                    var page = ordered.Skip(skip).Take(take)
+                        .Select(sr =>
+                        {
+                            try
+                            {
+                                var uac = GetProp<int?>(sr, "userAccountControl") ?? 0;
+                                var isDisabled = (uac & 0x2) == 0x2;
+                                
+                                var sam = GetProp<string>(sr, "sAMAccountName") ?? "";
+                                if (string.IsNullOrWhiteSpace(sam)) return null;
+
+                                var displayName = GetProp<string>(sr, "displayName");
+                                if (string.IsNullOrWhiteSpace(displayName))
+                                {
+                                    displayName = GetProp<string>(sr, "cn") ?? sam;
+                                }
+
+                                return new ADUserVm
+                                {
+                                    SamAccountName = sam,
+                                    DisplayName = displayName,
+                                    Email = GetProp<string>(sr, "mail") ?? "",
+                                    Enabled = !isDisabled,
+                                    SAM = sam,
+                                    DistinguishedName = GetProp<string>(sr, "distinguishedName"),
+                                    LastLogonUtc = ToDate(GetProp<long?>(sr, "lastLogonTimestamp"))
+                                };
+                            }
+                            catch (Exception ex)
+                            {
+                                _log.LogWarning(ex, "Failed to map SearchResult to ADUserVm");
+                                return null;
+                            }
+                        })
+                        .Where(u => u != null)
+                        .ToList()!;
+
+                    return (page, total);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "Failed to search AD users");
+                    throw;
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Failed to execute AD search");
+            throw;
+        }
+    }
+
+    public Task<ADObjectDetailsVm?> GetUserDetailsAsync(string? sam, string? dn)
+        {
+            if (string.IsNullOrWhiteSpace(sam) && string.IsNullOrWhiteSpace(dn))
+                throw new ArgumentException("Provide sam or dn.");
+
+            return Task.Run(() =>
+            {
+                try
+                {
+                    using var entry = MakeDirectoryEntry(_ldapPath);
+                    using var searcher = new DirectorySearcher(entry)
+                    {
+                        PageSize = 1,
+                        SizeLimit = 1
+                    };
+
+                    if (!string.IsNullOrWhiteSpace(sam))
+                    {
+                        searcher.Filter = $"(&(objectCategory=person)(objectClass=user)(sAMAccountName={EscapeLdap(sam)}))";
+                    }
+                    else
+                    {
+                        searcher.Filter = $"(&(objectCategory=person)(objectClass=user)(distinguishedName={EscapeLdap(dn!)}))";
+                    }
+
+                    searcher.PropertiesToLoad.AddRange(new[]
+                    {
+                        "displayName",
+                        "sAMAccountName",
+                        "distinguishedName",
+                        "mail",
+                        "userAccountControl",
+                        "lastLogonTimestamp",
+                        "whenCreated",
+                        "pwdLastSet",
+                        "department",
+                        "title",
+                        "telephoneNumber",
+                        "mobile",
+                        "manager",
+                        "company",
+                        "employeeID",
+                        "memberOf",
+                        "accountExpires"
+                    });
+
+                    var result = searcher.FindOne();
+                    if (result == null)
+                        return null;
+
+                    var uac = GetProp<int?>(result, "userAccountControl") ?? 0;
+                    var isDisabled = (uac & 0x2) == 0x2;
+                    var isLocked = (uac & 0x10) == 0x10;
+
+                    // استخراج المجموعات
+                    var memberOf = GetPropArray<string>(result, "memberOf") ?? Array.Empty<string>();
+                    var groups = memberOf.Select(dn => dn.Split(',')[0].Replace("CN=", "")).ToList();
+
+                    // التحقق من تاريخ انتهاء الحساب
+                    var accountExpires = GetProp<long?>(result, "accountExpires");
+                    string expirationStatus = "Never";
+                    if (accountExpires.HasValue && accountExpires.Value != 0 && accountExpires.Value != 9223372036854775807)
+                    {
+                        var expirationDate = DateTime.FromFileTime(accountExpires.Value);
+                        expirationStatus = expirationDate > DateTime.UtcNow ? expirationDate.ToString() : "Expired";
+                    }
+
+                    var details = new ADObjectDetailsVm 
+                    { 
+                        Name = GetProp<string>(result, "sAMAccountName") ?? "",
+                        DisplayName = GetProp<string>(result, "displayName") ?? GetProp<string>(result, "cn") ?? "",
+                        Type = "user",
+                        Properties = new Dictionary<string, string?>
+                        {
+                            ["Email"] = GetProp<string>(result, "mail"),
+                            ["Department"] = GetProp<string>(result, "department"),
+                            ["Title"] = GetProp<string>(result, "title"),
+                            ["Phone"] = GetProp<string>(result, "telephoneNumber"),
+                            ["Mobile"] = GetProp<string>(result, "mobile"),
+                            ["Company"] = GetProp<string>(result, "company"),
+                            ["EmployeeID"] = GetProp<string>(result, "employeeID"),
+                            ["Account Status"] = isDisabled ? "Disabled" : "Enabled",
+                            ["Account Lock"] = isLocked ? "Locked" : "Not locked",
+                            ["Last Logon"] = ToDate(GetProp<long?>(result, "lastLogonTimestamp"))?.ToString() ?? "Never",
+                            ["Created"] = GetProp<DateTime?>(result, "whenCreated")?.ToString() ?? "Unknown",
+                            ["Password Last Set"] = ToDate(GetProp<long?>(result, "pwdLastSet"))?.ToString() ?? "Never",
+                            ["Account Expires"] = expirationStatus,
+                            ["Groups"] = string.Join(", ", groups)
+                        }
+                    };
+
+                    return details;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "Failed to get user details for {Sam} / {Dn}", sam, dn);
+                    throw;
+                }
+            });
+        }
+
+        public Task<bool> EnableUserAsync(string sam) => throw new NotImplementedException();
+        public Task<bool> DisableUserAsync(string sam) => throw new NotImplementedException();
+        public Task<bool> ResetPasswordAsync(string sam, string newPassword) => throw new NotImplementedException();
+        public Task<bool> ExpirePasswordNowAsync(string sam) => throw new NotImplementedException();
+        public Task<bool> UnlockAccountAsync(string sam) => throw new NotImplementedException();
+        public Task<List<ADUserVm>> GetUsersAsync(string? q, int skip, int take) => throw new NotImplementedException();
+        public Task<ADUserVm?> GetUserAsync(string sam) => throw new NotImplementedException();
+        public Task<bool> SetUserEnabledAsync(string sam, bool enabled) => throw new NotImplementedException();
+        public Task<bool> ResetPasswordWithOptionsAsync(string sam, string newPassword, bool forceChange, bool unlock) => throw new NotImplementedException();
+        public Task<bool> UnlockUserAsync(string sam) => throw new NotImplementedException();
+        public Task<List<OUVm>> GetOuChildrenAsync(string dn) => throw new NotImplementedException();
+
+        #endregion
+
+        #region ===== Groups =====
+
+        public Task<List<ADGroupVm>> GetGroupsAsync(string? q, int skip, int take)
+        {
+            return Task.Run(() =>
+            {
+                using var entry = MakeDirectoryEntry(_ldapPath);
+                using var searcher = new DirectorySearcher(entry)
+                {
+                    Filter = "(objectClass=group)",
+                    PageSize = 500
+                };
+
+                searcher.PropertiesToLoad.AddRange(new[] 
+                { 
+                    "name",
+                    "sAMAccountName",
+                    "distinguishedName",
+                    "description",
+                    "member"
+                });
+
+                if (!string.IsNullOrWhiteSpace(q))
+                {
+                    var escaped = EscapeLdap(q);
+                    searcher.Filter = $"(&(objectClass=group)(|(name=*{escaped}*)(sAMAccountName=*{escaped}*)))";
+                }
+
+                var results = searcher.FindAll().Cast<SearchResult>();
+                return results
+                    .Select(r => new ADGroupVm
+                    {
+                        Name = GetProp<string>(r, "name") ?? "",
+                        SAM = GetProp<string>(r, "sAMAccountName"),
+                        DistinguishedName = GetProp<string>(r, "distinguishedName"),
+                        Description = GetProp<string>(r, "description"),
+                        MemberCount = r.Properties["member"]?.Count ?? 0
+                    })
+                    .Skip(skip)
+                    .Take(take)
+                    .ToList();
+            });
+        }
+
+        public Task<bool> AddUserToGroupAsync(string userSam, string groupSam)
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    using var context = new PrincipalContext(ContextType.Domain, _config["AD:Domain"]);
+                    using var user = UserPrincipal.FindByIdentity(context, IdentityType.SamAccountName, userSam);
+                    using var group = GroupPrincipal.FindByIdentity(context, IdentityType.SamAccountName, groupSam);
+
+                    if (user == null || group == null) return false;
+
+                    if (!group.Members.Contains(user))
+                    {
+                        group.Members.Add(user);
+                        group.Save();
+                    }
+
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "Failed to add user {UserSam} to group {GroupSam}", userSam, groupSam);
+                    return false;
+                }
+            });
+        }
+
+        public Task<bool> RemoveUserFromGroupAsync(string userSam, string groupSam)
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    using var context = new PrincipalContext(ContextType.Domain, _config["AD:Domain"]);
+                    using var user = UserPrincipal.FindByIdentity(context, IdentityType.SamAccountName, userSam);
+                    using var group = GroupPrincipal.FindByIdentity(context, IdentityType.SamAccountName, groupSam);
+
+                    if (user == null || group == null) return false;
+
+                    if (group.Members.Contains(user))
+                    {
+                        group.Members.Remove(user);
+                        group.Save();
+                    }
+
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "Failed to remove user {UserSam} from group {GroupSam}", userSam, groupSam);
+                    return false;
+                }
+            });
+        }
+
+        public Task<List<ADUserVm>> GetGroupMembersAsync(string groupSam)
+        {
+            return Task.Run(() =>
+            {
+                using var context = new PrincipalContext(ContextType.Domain, _config["AD:Domain"]);
+                using var group = GroupPrincipal.FindByIdentity(context, IdentityType.SamAccountName, groupSam);
+                
+                if (group == null) return new List<ADUserVm>();
+
+                return group.Members
+                    .Cast<UserPrincipal>()
+                    .Where(u => u != null)
+                    .Select(u => new ADUserVm
+                    {
+                        DisplayName = u.DisplayName ?? u.Name ?? u.SamAccountName ?? "",
+                        SAM = u.SamAccountName,
+                        Email = u.EmailAddress,
+                        DistinguishedName = u.DistinguishedName,
+                        LastLogonUtc = u.LastLogon
+                    })
+                    .ToList();
+            });
+        }
+
+        public async Task<List<OUVm>> GetRootOusAsync()
+        {
+            return await Task.Run(() =>
+            {
+                using var entry = MakeDirectoryEntry(_ldapPath);
+                using var searcher = new DirectorySearcher(entry)
+                {
+                    Filter = "(objectClass=organizationalUnit)",
+                    SearchScope = SearchScope.OneLevel,
+                    PageSize = 1000,
+                    SizeLimit = 0,
+                    ServerTimeLimit = _searchTimeout,
+                    ClientTimeout = _searchTimeout,
+                    CacheResults = true,
+                    ServerPageTimeLimit = TimeSpan.FromSeconds(5)
+                };
+
+                searcher.PropertiesToLoad.AddRange(new[] { "name", "distinguishedName", "description" });
+
+                var results = searcher.FindAll().Cast<SearchResult>();
+                return results.Select(r => new OUVm
+                {
+                    Name = GetProp<string>(r, "name") ?? "",
+                    DistinguishedName = GetProp<string>(r, "distinguishedName") ?? "",
+                    Description = GetProp<string>(r, "description")
+                }).ToList();
+            });
+        }
+
+        public Task<List<OUVm>> GetChildOUsAsync(string? parentDn)
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    // إذا لم يتم تحديد الـ parentDn، نجلب الوحدات الرئيسية
+                    if (string.IsNullOrWhiteSpace(parentDn))
+                    {
+                        using var rootEntry = MakeDirectoryEntry(_ldapPath);
+                        using var searcher = new DirectorySearcher(rootEntry)
+                        {
+                            Filter = "(objectClass=organizationalUnit)",
+                            SearchScope = SearchScope.OneLevel,
+                            PageSize = 1000,
+                            SizeLimit = 0
+                        };
+
+                        searcher.PropertiesToLoad.AddRange(new[] { "name", "distinguishedName", "description" });
+                        var results = searcher.FindAll().Cast<SearchResult>();
+                        return results.Select(r => new OUVm
+                        {
+                            Name = GetProp<string>(r, "name") ?? "",
+                            DistinguishedName = GetProp<string>(r, "distinguishedName") ?? "",
+                            Description = GetProp<string>(r, "description")
+                        }).ToList();
+                    }
+
+                    // للوحدات الفرعية، نستخدم الـ DN المحدد مباشرة
+                    using var parentEntry = MakeDirectoryEntry($"LDAP://{parentDn}");
+                    using var childSearcher = new DirectorySearcher(parentEntry)
+                    {
+                        Filter = "(objectClass=organizationalUnit)",
+                        SearchScope = SearchScope.OneLevel,
+                        PageSize = 1000,
+                        SizeLimit = 0,
+                        ServerTimeLimit = _searchTimeout,
+                        ClientTimeout = _searchTimeout
+                    };
+
+                    childSearcher.PropertiesToLoad.AddRange(new[] { "name", "distinguishedName", "description" });
+
+                    var childResults = childSearcher.FindAll().Cast<SearchResult>();
+                    return childResults.Select(r => new OUVm
+                    {
+                        Name = GetProp<string>(r, "name") ?? "",
+                        DistinguishedName = GetProp<string>(r, "distinguishedName") ?? "",
+                        Description = GetProp<string>(r, "description")
+                    }).ToList();
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "Failed to get child OUs for parent DN: {ParentDN}", parentDn);
+                    throw;
+                }
+            });
+        }
+
+        public Task<List<ADObjectVm>> GetOuObjectsAsync(string dn, int skip, int take, string? q)
+        {
+            return Task.Run(() =>
+            {
+                using var entry = MakeDirectoryEntry(_ldapPath);
+                using var searcher = new DirectorySearcher(entry)
+                {
+                    Filter = $"(&(|(objectClass=user)(objectClass=group)(objectClass=computer))(distinguishedName={EscapeLdap(dn)}*))",
+                    SearchScope = SearchScope.Subtree,
+                    PageSize = 1000,
+                    SizeLimit = 0,
+                    ServerTimeLimit = _searchTimeout,
+                    ClientTimeout = _searchTimeout,
+                    CacheResults = true
+                };
+
+                searcher.PropertiesToLoad.AddRange(new[] { "name", "distinguishedName", "objectClass" });
+
+                if (!string.IsNullOrWhiteSpace(q))
+                {
+                    var escaped = EscapeLdap(q);
+                    searcher.Filter = $"(&{searcher.Filter}(name=*{escaped}*))";
+                }
+
+                var results = searcher.FindAll().Cast<SearchResult>();
+                
+                return results
+                    .Select(r => new ADObjectVm
+                    {
+                        Name = GetProp<string>(r, "name") ?? "",
+                        DistinguishedName = GetProp<string>(r, "distinguishedName") ?? "",
+                        ObjectClass = GetProp<string>(r, "objectClass")?.ToString()?.ToLowerInvariant() ?? "unknown"
+                    })
+                    .Skip(skip)
+                    .Take(take)
+                    .ToList();
+            });
+        }
+
+        public Task<bool> CreateOUAsync(string parentDn, string name, string? description)
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    using var parentEntry = MakeDirectoryEntry($"LDAP://{parentDn}");
+                    using var newOu = parentEntry.Children.Add($"OU={name}", "organizationalUnit");
+                    
+                    if (!string.IsNullOrWhiteSpace(description))
+                    {
+                        newOu.Properties["description"].Value = description;
+                    }
+                    
+                    newOu.CommitChanges();
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "Failed to create OU {Name} under {ParentDN}", name, parentDn);
+                    return false;
+                }
+            });
+        }
+
+        public Task<bool> DeleteOUAsync(string dn)
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    using var entry = MakeDirectoryEntry($"LDAP://{dn}");
+                    using var parent = entry.Parent;
+                    parent?.Children.Remove(entry);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "Failed to delete OU {DN}", dn);
+                    return false;
+                }
+            });
+        }
+
+        // Implementations for other OU methods
+        public Task<bool> CreateOuAsync(string parentDn, string ouName) => CreateOUAsync(parentDn, ouName, null);
+        public Task<List<OUVm>> GetOUsAsync(string? q, int skip, int take) => throw new NotImplementedException();
+        public Task<ADObjectDetailsVm?> GetObjectDetailsAsync(string dn) => throw new NotImplementedException();
+        public Task<bool> RenameOUAsync(string dn, string newName) => throw new NotImplementedException();
+        public Task<bool> MoveObjectAsync(string dn, string targetOuDn) => throw new NotImplementedException();
+        public Task<bool> MoveUserBySamAsync(string sam, string targetOuDn) => throw new NotImplementedException();
+
+        #endregion
+
+        #region ===== Helpers =====
+
+        private DirectoryEntry MakeDirectoryEntry(string path)
+        {
+            try
+            {
+                var authTypes = AuthenticationTypes.Secure | AuthenticationTypes.Sealing | AuthenticationTypes.Signing;
+                
+                if (!string.IsNullOrWhiteSpace(_bindUser) && !string.IsNullOrWhiteSpace(_bindPassword))
+                {
+                    var entry = new DirectoryEntry(path, _bindUser, _bindPassword, authTypes);
+                    entry.AuthenticationType = authTypes;
+                    return entry;
+                }
+                
+                var defaultEntry = new DirectoryEntry(path);
+                defaultEntry.AuthenticationType = authTypes;
+                return defaultEntry;
             }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Failed to create DirectoryEntry for path: {Path}", path);
+                throw new InvalidOperationException("Failed to connect to Active Directory. Please check your credentials and connection settings.", ex);
+            }
+        }
+
+        private static string EscapeLdap(string value)
+        {
+            // RFC 4515 escaping
+            return value
+                .Replace("\\", "\\5c")
+                .Replace("*", "\\2a")
+                .Replace("(", "\\28")
+                .Replace(")", "\\29")
+                .Replace("\0", "\\00");
+        }
+
+        private static T? GetProp<T>(SearchResult sr, string name)
+        {
+            if (!sr.Properties.Contains(name) || sr.Properties[name].Count == 0) return default;
+            try
+            {
+                var raw = sr.Properties[name][0];
+                if (raw == null) return default;
+
+                if (typeof(T) == typeof(string))
+                    return (T?)(object?)raw.ToString();
+
+                if (typeof(T) == typeof(long?) && raw is IConvertible)
+                {
+                    if (raw is long l) return (T?)(object?)l;
+                    if (long.TryParse(raw.ToString(), out var ll))
+                        return (T?)(object?)ll;
+                }
+
+                if (typeof(T) == typeof(int?) && raw is IConvertible)
+                {
+                    if (raw is int i) return (T?)(object?)i;
+                    if (int.TryParse(raw.ToString(), out var ii))
+                        return (T?)(object?)ii;
+                }
+
+                return (T?)raw;
+            }
+            catch { /* ignore */ }
+            return default;
+        }
+
+        private static T[]? GetPropArray<T>(SearchResult sr, string name)
+        {
+            if (!sr.Properties.Contains(name)) return null;
+            
+            try
+            {
+                var props = sr.Properties[name];
+                var result = new T[props.Count];
+                
+                for (int i = 0; i < props.Count; i++)
+                {
+                    var raw = props[i];
+                    if (raw == null) continue;
+
+                    if (typeof(T) == typeof(string))
+                        result[i] = (T)(object)raw.ToString()!;
+                    else
+                        result[i] = (T)raw;
+                }
+
+                return result;
+            }
+            catch { /* ignore */ }
+            
+            return null;
+        }
+
+        private static DateTime? ToDate(long? fileTime)
+        {
+            if (fileTime == null || fileTime <= 0) return null;
+            try { return DateTime.FromFileTimeUtc(fileTime.Value); }
             catch { return null; }
         }
 
-        private static string ClassFromResult(SearchResult r)
-        {
-            if (r.Properties["objectClass"]?.Count > 0)
-            {
-                var arr = r.Properties["objectClass"];
-                var last = arr[arr.Count - 1]?.ToString()?.ToLowerInvariant();
-                if (last == "user" || last == "group" || last == "computer")
-                    return last!;
-            }
-            return "other";
-        }
 
-        // ===== Users (بسيط) =====
-        public async Task<List<ADUserVm>> GetUsersAsync(string? search = null, int take = 100, int skip = 0)
-        {
-            return await Task.Run(() =>
-            {
-                using var ctx = CreateContext();
-                var q = new UserPrincipal(ctx);
-                if (!string.IsNullOrWhiteSpace(search))
-                    q.SamAccountName = $"*{search}*";
 
-                using var ps = new PrincipalSearcher(q);
-                return ps.FindAll()
-                    .OfType<UserPrincipal>()
-                    .Skip(skip).Take(take)
-                    .Select(u => new ADUserVm
-                    {
-                        SamAccountName = u.SamAccountName ?? "",
-                        DisplayName = u.DisplayName ?? "",
-                        Email = u.EmailAddress ?? "",
-                        Enabled = u.Enabled ?? false
-                    }).ToList();
-            });
-        }
-
-        public async Task<ADUserVm?> GetUserAsync(string samAccountName)
-        {
-            return await Task.Run(() =>
-            {
-                using var ctx = CreateContext();
-                var user = UserPrincipal.FindByIdentity(ctx, samAccountName);
-                if (user == null) return null;
-                return new ADUserVm
-                {
-                    SamAccountName = user.SamAccountName ?? "",
-                    DisplayName = user.DisplayName ?? "",
-                    Email = user.EmailAddress ?? "",
-                    Enabled = user.Enabled ?? false
-                };
-            });
-        }
-
-        public async Task<bool> SetUserEnabledAsync(string samAccountName, bool enabled)
-        {
-            return await Task.Run(() =>
-            {
-                using var ctx = CreateContext();
-                var user = UserPrincipal.FindByIdentity(ctx, samAccountName);
-                if (user == null) return false;
-                user.Enabled = enabled;
-                user.Save();
-                return true;
-            });
-        }
-
-        public async Task<bool> ResetPasswordAsync(string samAccountName, string newPassword)
-        {
-            return await Task.Run(() =>
-            {
-                using var ctx = CreateContext();
-                var user = UserPrincipal.FindByIdentity(ctx, samAccountName);
-                if (user == null) return false;
-                user.SetPassword(newPassword);
-                user.Save();
-                return true;
-            });
-        }
-
-        public async Task<bool> ResetPasswordWithOptionsAsync(string samAccountName, string newPassword, bool forceChangeAtNextLogon, bool unlockIfLocked)
-        {
-            return await Task.Run(() =>
-            {
-                using var ctx = CreateContext();
-                var user = UserPrincipal.FindByIdentity(ctx, samAccountName) as UserPrincipal;
-                if (user == null) return false;
-
-                user.SetPassword(newPassword);
-
-                if (forceChangeAtNextLogon)
-                    user.ExpirePasswordNow();
-
-                if (unlockIfLocked && user.IsAccountLockedOut())
-                    user.UnlockAccount();
-
-                user.Save();
-                return true;
-            });
-        }
-
-        public async Task<bool> UnlockUserAsync(string samAccountName)
-        {
-            return await Task.Run(() =>
-            {
-                using var ctx = CreateContext();
-                var user = UserPrincipal.FindByIdentity(ctx, samAccountName) as UserPrincipal;
-                if (user == null) return false;
-                if (user.IsAccountLockedOut()) user.UnlockAccount();
-                user.Save();
-                return true;
-            });
-        }
-
-        // ===== Users (متقدم) =====
-        public async Task<(List<ADUserVm> Items, int Total)> GetUsersAdvancedAsync(UsersQueryOptions opts)
-        {
-            return await Task.Run(() =>
-            {
-                string baseDn = string.IsNullOrWhiteSpace(opts.OuDn) ? GetDefaultNamingContext() : opts.OuDn!;
-                var parts = new List<string>
-                {
-                    "(&(objectCategory=person)(objectClass=user))"
-                };
-
-                if (!string.IsNullOrWhiteSpace(opts.Q))
-                {
-                    var q = opts.Q!.Replace(")", "").Replace("(", "");
-                    parts.Add($"(|(displayName=*{q}*)(sAMAccountName=*{q}*)(mail=*{q}*))");
-                }
-
-                switch (opts.Status)
-                {
-                    case UserStatusFilter.Enabled:
-                        parts.Add("(!(userAccountControl:1.2.840.113556.1.4.803:=2))"); // NOT disabled
-                        break;
-                    case UserStatusFilter.Disabled:
-                        parts.Add("(userAccountControl:1.2.840.113556.1.4.803:=2)"); // disabled
-                        break;
-                    case UserStatusFilter.Locked:
-                        // لا يوجد فلتر LDAP مباشر للـ lock؛ سنفلتر لاحقًا عبر Principal إذا احتجنا.
-                        break;
-                }
-
-                string filter = $"(&{string.Join("", parts)})";
-
-                var props = new[] {
-                    "displayName","sAMAccountName","mail","userAccountControl","lastLogonTimestamp","lastLogon","distinguishedName"
-                };
-
-                using var ds = MakeSearcher(baseDn, SearchScope.Subtree, filter, props);
-
-                // جلب النتائج (سنحسب الإجمالي بعد الفلترة الإضافية)
-                var all = ds.FindAll().Cast<SearchResult>().ToList();
-
-                // فلترة lock إن طلب
-                IEnumerable<SearchResult> filtered = all;
-                if (opts.Status == UserStatusFilter.Locked)
-                {
-                    using var ctx = CreateContext();
-                    filtered = all.Where(r =>
-                    {
-                        var dn = r.Properties["distinguishedName"]?.Count > 0 ? r.Properties["distinguishedName"][0]?.ToString() : null;
-                        if (string.IsNullOrWhiteSpace(dn)) return false;
-                        var up = UserPrincipal.FindByIdentity(ctx, IdentityType.DistinguishedName, dn!);
-                        return (up?.IsAccountLockedOut() ?? false);
-                    }).ToList();
-                }
-
-                // فرز
-                Func<SearchResult, object?> keySel = r =>
-                {
-                    object? v = null;
-                    var s = (opts.SortBy ?? "displayName").ToLowerInvariant();
-                    if (s is "sam" or "sAMAccountName") s = "sAMAccountName";
-                    if (s == "sam") s = "sAMAccountName";
-                    switch (s)
-                    {
-                        case "displayname": v = r.Properties["displayName"]?.Count > 0 ? r.Properties["displayName"][0] : null; break;
-                        case "sam":
-                        case "samaccountname": v = r.Properties["sAMAccountName"]?.Count > 0 ? r.Properties["sAMAccountName"][0] : null; break;
-                        case "email":
-                            v = r.Properties["mail"]?.Count > 0 ? r.Properties["mail"][0] : null; break;
-                        case "lastlogon":
-                            v = ReadFileTimeUtc(r.Properties["lastLogonTimestamp"]?.Count > 0 ? r.Properties["lastLogonTimestamp"][0] : null)
-                                ?? ReadFileTimeUtc(r.Properties["lastLogon"]?.Count > 0 ? r.Properties["lastLogon"][0] : null);
-                            break;
-                        default:
-                            v = r.Properties["displayName"]?.Count > 0 ? r.Properties["displayName"][0] : null;
-                            break;
-                    }
-                    return v;
-                };
-
-                filtered = opts.Desc ? filtered.OrderByDescending(keySel) : filtered.OrderBy(keySel);
-
-                var total = filtered.Count();
-
-                var page = filtered.Skip(opts.Skip).Take(opts.Take)
-                    .Select(r =>
-                    {
-                        string sam = r.Properties["sAMAccountName"]?.Count > 0 ? r.Properties["sAMAccountName"][0]?.ToString() ?? "" : "";
-                        string disp = r.Properties["displayName"]?.Count > 0 ? r.Properties["displayName"][0]?.ToString() ?? "" : "";
-                        string? mail = r.Properties["mail"]?.Count > 0 ? r.Properties["mail"][0]?.ToString() : null;
-                        bool? enabled = null;
-                        if (r.Properties["userAccountControl"]?.Count > 0)
-                        {
-                            int uac = Convert.ToInt32(r.Properties["userAccountControl"][0]);
-                            enabled = !IsDisabledUac(uac);
-                        }
-
-                        return new ADUserVm
-                        {
-                            SamAccountName = sam,
-                            DisplayName = disp,
-                            Email = mail ?? "",
-                            Enabled = enabled ?? true
-                        };
-                    }).ToList();
-
-                return (page, total);
-            });
-        }
-
-        public async Task<ADObjectDetailsVm?> GetUserDetailsAsync(string? sam = null, string? dn = null)
-        {
-            return await Task.Run(() =>
-            {
-                string? dn2 = dn;
-
-                if (string.IsNullOrWhiteSpace(dn2) && !string.IsNullOrWhiteSpace(sam))
-                {
-                    using var ctx = CreateContext();
-                    var up = UserPrincipal.FindByIdentity(ctx, sam!);
-                    if (up == null) return null;
-                    var de = up.GetUnderlyingObject() as DirectoryEntry;
-                    dn2 = de?.Properties["distinguishedName"]?.Value?.ToString();
-                }
-
-                if (string.IsNullOrWhiteSpace(dn2)) return null;
-
-                using var entry = new DirectoryEntry(BuildPath(dn2), _cfg["AD:ServiceUserUPN"], _cfg["AD:ServicePassword"]);
-                using var ds = new DirectorySearcher(entry)
-                {
-                    SearchScope = SearchScope.Base,
-                    Filter = "(objectClass=*)",
-                    ClientTimeout = TimeSpan.FromSeconds(20),
-                    ServerTimeLimit = TimeSpan.FromSeconds(20),
-                    ReferralChasing = ReferralChasingOption.None
-                };
-                ds.PropertiesToLoad.AddRange(new[]
-                {
-                    "name","distinguishedName","sAMAccountName","objectClass",
-                    "mail","userAccountControl","lastLogonTimestamp","lastLogon",
-                    "pwdLastSet","accountExpires"
-                });
-
-                var res = ds.FindOne();
-                if (res == null) return null;
-
-                string name = res.Properties["name"]?.Count > 0 ? res.Properties["name"][0]?.ToString() ?? "" : "";
-                string dn3  = res.Properties["distinguishedName"]?.Count > 0 ? res.Properties["distinguishedName"][0]?.ToString() ?? "" : "";
-                string? sam2 = res.Properties["sAMAccountName"]?.Count > 0 ? res.Properties["sAMAccountName"][0]?.ToString() : null;
-                string oc   = ClassFromResult(res);
-                string? mail = res.Properties["mail"]?.Count > 0 ? res.Properties["mail"][0]?.ToString() : null;
-
-                bool? enabled = null;
-                if (res.Properties["userAccountControl"]?.Count > 0)
-                {
-                    int uac = Convert.ToInt32(res.Properties["userAccountControl"][0]);
-                    enabled = !IsDisabledUac(uac);
-                }
-
-                DateTime? lastLogon = ReadFileTimeUtc(res.Properties["lastLogonTimestamp"]?.Count > 0 ? res.Properties["lastLogonTimestamp"][0] : null)
-                                      ?? ReadFileTimeUtc(res.Properties["lastLogon"]?.Count > 0 ? res.Properties["lastLogon"][0] : null);
-
-                // pwdLastSet / accountExpires
-                DateTime? pwdLastSetUtc = ReadFileTimeUtc(res.Properties["pwdLastSet"]?.Count > 0 ? res.Properties["pwdLastSet"][0] : null);
-                DateTime? accExpiresUtc = ReadFileTimeUtc(res.Properties["accountExpires"]?.Count > 0 ? res.Properties["accountExpires"][0] : null);
-
-                bool? locked = null;
-                if (oc == "user" && !string.IsNullOrWhiteSpace(dn3))
-                {
-                    using var ctx = CreateContext();
-                    var up = UserPrincipal.FindByIdentity(ctx, IdentityType.DistinguishedName, dn3);
-                    if (up != null) locked = up.IsAccountLockedOut();
-                }
-
-                // Groups
-                var groups = new List<string>();
-                if (!string.IsNullOrWhiteSpace(sam2))
-                {
-                    using var ctx = CreateContext();
-                    var up = UserPrincipal.FindByIdentity(ctx, sam2);
-                    if (up != null)
-                    {
-                        try
-                        {
-                            foreach (var g in up.GetAuthorizationGroups())
-                            {
-                                try { groups.Add(g.Name); } catch { /* ignore */ }
-                            }
-                        }
-                        catch { /* بعض الدومينات ترمي استثناء هنا */ }
-                    }
-                }
-
-                var vm = new ADObjectDetailsVm
-                {
-                    Name = name,
-                    DistinguishedName = dn3,
-                    SamAccountName = sam2,
-                    ObjectClass = oc,
-                    Email = mail,
-                    Enabled = enabled,
-                    Locked = locked,
-                    LastLogonUtc = lastLogon
-                };
-
-                // Extra (أنواعها غير نصية — ما في تحويل)
-                vm.Extra["parentDn"] = GetParentDn(dn3);
-                vm.Extra["passwordLastSetUtc"] = pwdLastSetUtc;
-                vm.Extra["accountExpiresUtc"] = accExpiresUtc;
-                vm.Extra["groups"] = groups;
-
-                return vm;
-            });
-        }
-
-        // ===== Groups =====
-        public async Task<List<ADGroupVm>> GetGroupsAsync(string? search = null, int take = 100, int skip = 0)
-        {
-            return await Task.Run(() =>
-            {
-                using var ctx = CreateContext();
-                var q = new GroupPrincipal(ctx);
-                if (!string.IsNullOrWhiteSpace(search))
-                    q.Name = $"*{search}*";
-                using var ps = new PrincipalSearcher(q);
-                return ps.FindAll()
-                    .Skip(skip).Take(take)
-                    .OfType<GroupPrincipal>()
-                    .Select(g => new ADGroupVm
-                    {
-                        Name = g.SamAccountName ?? g.Name ?? "",
-                        Description = g.Description ?? ""
-                    }).ToList();
-            });
-        }
-
-        public async Task<bool> AddUserToGroupAsync(string samAccountName, string groupName)
-        {
-            return await Task.Run(() =>
-            {
-                using var ctx = CreateContext();
-                var user = UserPrincipal.FindByIdentity(ctx, samAccountName);
-                var grp = GroupPrincipal.FindByIdentity(ctx, groupName);
-                if (user == null || grp == null) return false;
-                grp.Members.Add(user);
-                grp.Save();
-                return true;
-            });
-        }
-
-        public async Task<bool> RemoveUserFromGroupAsync(string samAccountName, string groupName)
-        {
-            return await Task.Run(() =>
-            {
-                using var ctx = CreateContext();
-                var user = UserPrincipal.FindByIdentity(ctx, samAccountName);
-                var grp = GroupPrincipal.FindByIdentity(ctx, groupName);
-                if (user == null || grp == null) return false;
-                grp.Members.Remove(user);
-                grp.Save();
-                return true;
-            });
-        }
-
-        // ===== OUs =====
-        public async Task<List<OUVm>> GetOUsAsync(string? baseDn = null, int take = 500, int skip = 0)
-        {
-            return await Task.Run(() =>
-            {
-                var dn = string.IsNullOrWhiteSpace(baseDn) ? GetDefaultNamingContext() : baseDn!;
-                _logger.LogInformation("GetOUsAsync: baseDn={BaseDn}", dn);
-
-                using var ds = MakeSearcher(dn, SearchScope.Subtree, "(objectClass=organizationalUnit)",
-                    new[] { "name", "distinguishedName", "description" });
-
-                var results = new List<OUVm>();
-                foreach (SearchResult r in ds.FindAll().Cast<SearchResult>().Skip(skip).Take(take))
-                {
-                    var ouDn = r.Properties["distinguishedName"]?.Count > 0 ? r.Properties["distinguishedName"][0]?.ToString() ?? "" : "";
-                    var name = r.Properties["name"]?.Count > 0 ? r.Properties["name"][0]?.ToString() ?? "" : "";
-                    var desc = r.Properties["description"]?.Count > 0 ? r.Properties["description"][0]?.ToString() ?? "" : null;
-
-                    results.Add(new OUVm
-                    {
-                        Name = name,
-                        DistinguishedName = ouDn,
-                        ParentDn = GetParentDn(ouDn),
-                        Description = desc,
-                        ChildCount = 1
-                    });
-                }
-                _logger.LogInformation("GetOUsAsync: returned {Count} items.", results.Count);
-                return results;
-            });
-        }
-
-        public async Task<List<OUVm>> GetChildOUsAsync(string? parentDn = null)
-        {
-            return await Task.Run(() =>
-            {
-                string baseDn = string.IsNullOrWhiteSpace(parentDn) ? GetDefaultNamingContext() : parentDn!;
-                _logger.LogInformation("GetChildOUsAsync: parentDn={Parent}", baseDn);
-
-                using var ds = MakeSearcher(baseDn, SearchScope.OneLevel, "(objectClass=organizationalUnit)",
-                    new[] { "name", "distinguishedName", "description" });
-
-                var list = new List<OUVm>();
-                foreach (SearchResult r in ds.FindAll())
-                {
-                    var dn = r.Properties["distinguishedName"]?.Count > 0 ? r.Properties["distinguishedName"][0]?.ToString() ?? "" : "";
-                    var name = r.Properties["name"]?.Count > 0 ? r.Properties["name"][0]?.ToString() ?? "" : "";
-                    var desc = r.Properties["description"]?.Count > 0 ? r.Properties["description"][0]?.ToString() ?? "" : null;
-
-                    list.Add(new OUVm
-                    {
-                        Name = name,
-                        DistinguishedName = dn,
-                        ParentDn = baseDn,
-                        Description = desc,
-                        ChildCount = 1
-                    });
-                }
-                _logger.LogInformation("GetChildOUsAsync: returned {Count} items.", list.Count);
-                return list;
-            });
-        }
-
-        // ===== Objects in OU =====
-        public async Task<List<ADObjectVm>> GetOuObjectsAsync(string ouDn, int take = 200, int skip = 0, string? search = null)
-        {
-            return await Task.Run(() =>
-            {
-                string searchPart = string.IsNullOrWhiteSpace(search) ? "" : $"(|(name=*{search}*)(sAMAccountName=*{search}*)(mail=*{search}*))";
-                string filter = $"(&(|(&(objectCategory=person)(objectClass=user))(objectClass=group)(objectClass=computer)){searchPart})";
-
-                using var ds = MakeSearcher(ouDn, SearchScope.OneLevel, filter,
-                    new[] { "name", "distinguishedName", "sAMAccountName", "objectClass", "userAccountControl" });
-
-                var list = new List<ADObjectVm>();
-                foreach (SearchResult r in ds.FindAll().Cast<SearchResult>().Skip(skip).Take(take))
-                {
-                    string dn = r.Properties["distinguishedName"]?.Count > 0 ? r.Properties["distinguishedName"][0]?.ToString() ?? "" : "";
-                    string name = r.Properties["name"]?.Count > 0 ? r.Properties["name"][0]?.ToString() ?? "" : "";
-                    string? sam = r.Properties["sAMAccountName"]?.Count > 0 ? r.Properties["sAMAccountName"][0]?.ToString() : null;
-
-                    string oc = ClassFromResult(r);
-                    bool? disabled = null;
-                    if (r.Properties["userAccountControl"]?.Count > 0)
-                    {
-                        int uac = Convert.ToInt32(r.Properties["userAccountControl"][0]);
-                        disabled = IsDisabledUac(uac);
-                    }
-
-                    list.Add(new ADObjectVm
-                    {
-                        Name = name,
-                        DistinguishedName = dn,
-                        SamAccountName = sam,
-                        ObjectClass = oc,
-                        Disabled = disabled
-                    });
-                }
-
-                _logger.LogInformation("GetOuObjectsAsync: {Count} objects under {Ou}", list.Count, ouDn);
-                return list;
-            });
-        }
-
-        // ===== Object details (عام) =====
-        public async Task<ADObjectDetailsVm?> GetObjectDetailsAsync(string dn)
-        {
-            return await GetUserDetailsAsync(null, dn);
-        }
-
-        // ===== Mutations for OU =====
-        public async Task<bool> CreateOUAsync(string parentDn, string name, string? description = null) =>
-            await Task.Run(() =>
-            {
-                using var parent = new DirectoryEntry(BuildPath(parentDn), _cfg["AD:ServiceUserUPN"], _cfg["AD:ServicePassword"]);
-                using var newOu = parent.Children.Add($"OU={name}", "organizationalUnit");
-                if (!string.IsNullOrWhiteSpace(description)) newOu.Properties["description"].Value = description;
-                newOu.CommitChanges(); return true;
-            });
-
-        public async Task<bool> RenameOUAsync(string dn, string newName) =>
-            await Task.Run(() =>
-            {
-                using var ou = new DirectoryEntry(BuildPath(dn), _cfg["AD:ServiceUserUPN"], _cfg["AD:ServicePassword"]);
-                ou.Rename($"OU={newName}"); ou.CommitChanges(); return true;
-            });
-
-        public async Task<bool> DeleteOUAsync(string dn) =>
-            await Task.Run(() =>
-            {
-                using var ou = new DirectoryEntry(BuildPath(dn), _cfg["AD:ServiceUserUPN"], _cfg["AD:ServicePassword"]);
-                var parentDn = GetParentDn(dn); if (parentDn == null) return false;
-                using var parent = new DirectoryEntry(BuildPath(parentDn), _cfg["AD:ServiceUserUPN"], _cfg["AD:ServicePassword"]);
-                var cn = $"OU={ou.Properties["name"].Value}";
-                var childToRemove = parent.Children.Find(cn, "organizationalUnit");
-                parent.Children.Remove(childToRemove);
-                parent.CommitChanges(); return true;
-            });
-
-        public async Task<bool> MoveObjectAsync(string objectDn, string targetOuDn) =>
-            await Task.Run(() =>
-            {
-                using var obj = new DirectoryEntry(BuildPath(objectDn), _cfg["AD:ServiceUserUPN"], _cfg["AD:ServicePassword"]);
-                using var target = new DirectoryEntry(BuildPath(targetOuDn), _cfg["AD:ServiceUserUPN"], _cfg["AD:ServicePassword"]);
-                obj.MoveTo(target); obj.CommitChanges(); return true;
-            });
-
-        public async Task<bool> MoveUserBySamAsync(string samAccountName, string targetOuDn) =>
-            await Task.Run(() =>
-            {
-                using var ctx = CreateContext();
-                var user = UserPrincipal.FindByIdentity(ctx, samAccountName) as UserPrincipal;
-                if (user == null) return false;
-                var de = user.GetUnderlyingObject() as DirectoryEntry;
-                var dn = de?.Properties["distinguishedName"]?.Value?.ToString();
-                if (string.IsNullOrWhiteSpace(dn)) return false;
-                return MoveObjectAsync(dn!, targetOuDn).GetAwaiter().GetResult();
-            });
+        #endregion
     }
 }
