@@ -109,7 +109,9 @@ export default function OUsTreePage() {
     }
     const res = await fetch(url, { headers });
     if (!res.ok) throw new Error(await res.text());
-    return (await res.json()) as { name: string; distinguishedName: string }[];
+    const data = await res.json();
+    console.log("Fetched children for", dn || "root", ":", data);
+    return data as { name: string; distinguishedName: string }[];
   }
 
   async function fetchObjects(dn: string, searchTerm?: string) {
@@ -164,8 +166,12 @@ export default function OUsTreePage() {
     try {
       setLoadingNode(node.dn || "(root)");
       const children = await fetchChildren(node.dn || undefined);
-      node.children = children.map((c) => ({ dn: c.distinguishedName, name: c.name, open: false, loaded: false, children: [] }));
-      node.loaded = true; setRoot((r) => ({ ...r }));
+      console.log("Processing children for", node.dn || "root", ":", children);
+      const newChildren = children.map((c) => ({ dn: c.distinguishedName, name: c.name, open: false, loaded: false, children: [] }));
+      node.children = newChildren;
+      node.loaded = true;
+      console.log("Updated node:", node);
+      setRoot({ ...root });
     } catch (e) { console.error(e); alert("Failed to load OUs"); }
     finally { setLoadingNode(null); }
   }
@@ -178,8 +184,12 @@ export default function OUsTreePage() {
   }
 
   async function onToggle(node: OUNode) {
-    node.open = !node.open; setRoot((r) => ({ ...r }));
-    if (node.open && !node.loaded) await loadChildren(node);
+    node.open = !node.open;
+    setRoot({ ...root });
+    if (node.open && !node.loaded) {
+      console.log("Loading children for node:", node.dn || "root");
+      await loadChildren(node);
+    }
   }
 
   async function onSelect(node: OUNode) {
@@ -288,6 +298,7 @@ export default function OUsTreePage() {
 
   function renderNode(node: OUNode, level = 0) {
     const isLoading = loadingNode === (node.dn || "(root)");
+    const hasChildren = node.children && node.children.length > 0;
     return (
       <Box key={node.dn || "ROOT"}>
         <ListItemButton onClick={() => onSelect(node)} sx={{ pl: 2 + level * 2, bgcolor: selectedDn === node.dn ? "action.selected" : undefined }}>
@@ -304,8 +315,8 @@ export default function OUsTreePage() {
         <Collapse in={node.open} timeout="auto" unmountOnExit>
           {node.loaded ? (
             <List disablePadding>
-              {node.children.map((c) => renderNode(c, level + 1))}
-              {node.children.length === 0 && (
+              {hasChildren && node.children.map((c) => renderNode(c, level + 1))}
+              {!hasChildren && (
                 <Typography variant="body2" sx={{ pl: 6, py: 1, color: "text.secondary" }}>(No child OUs)</Typography>
               )}
             </List>
