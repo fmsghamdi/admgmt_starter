@@ -1,544 +1,430 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using System.Management.Automation;
 
 namespace admgmt_backend.Services
 {
-    /*public sealed class OUVm
+    public class PowerShellAdService : IADService
     {
-        public string Name { get; set; } = "";
-        public string DistinguishedName { get; set; } = "";
-        public string? Description { get; set; }
-    }*/
+        private readonly PowerShellRunner _ps;
+        private readonly AdOptions _opt;
 
-    /*public sealed class ADUserVm
-    {
-        public string DisplayName { get; set; } = "";
-        public string SAM { get; set; } = "";
-        public string Email { get; set; } = "";
-        public string DistinguishedName { get; set; } = "";
-        public DateTime? LastLogonUtc { get; set; }
-        public bool Enabled { get; set; }
-    }*/
-
-    /*public sealed class ADGroupVm
-    {
-        public string Name { get; set; } = "";
-        public string SAM { get; set; } = "";
-        public string DistinguishedName { get; set; } = "";
-        public string? Description { get; set; }
-        public int MemberCount { get; set; }
-    }*/
-
-   /* public sealed class ADObjectVm
-    {
-        public string Name { get; set; } = "";
-        public string DistinguishedName { get; set; } = "";
-        public string ObjectClass { get; set; } = "";
-    }*/
-
-   /* public sealed class ADObjectDetailsVm
-    {
-        public string Name { get; set; } = "";
-        public string DistinguishedName { get; set; } = "";
-        public string ObjectClass { get; set; } = "";
-        public string? SAM { get; set; }
-        public string? Email { get; set; }
-        public DateTime? LastLogonUtc { get; set; }
-        public bool? Enabled { get; set; }
-        public string? Description { get; set; }
-        public int? MemberCount { get; set; }
-        public List<string>? MembersSam { get; set; }
-    }*/
-
-    /*public sealed class UsersQueryOptions
-    {
-        public string? Query { get; set; }
-        public int Skip { get; set; }
-        public int Take { get; set; } = 50;
-        public string? OuDistinguishedName { get; set; }
-    }*/
-
-    public sealed class PowerShellAdService : IADService
-    {
-        private readonly ILogger<PowerShellAdService> _log;
-        private readonly string _baseDn;
-
-        public PowerShellAdService(IConfiguration cfg, ILogger<PowerShellAdService> log)
+        // مهم: ما نسوي أي عمل هنا غير التخزين. لا Import-Module ولا تحقق اتصال.
+        public PowerShellAdService(PowerShellRunner ps, IOptions<AdOptions> opt)
         {
-            _log = log;
-            _baseDn = cfg["AD:BaseDN"] ?? "";
-            if (string.IsNullOrWhiteSpace(_baseDn))
-                throw new ArgumentException("Missing config AD:BaseDN (e.g., DC=UQU,DC=LOCAL)");
+            _ps = ps;
+            _opt = opt?.Value ?? new AdOptions();
         }
 
-        public Task<List<OUVm>> GetRootOusAsync() => GetOUsAsync(null, 0, 1000);
+        // Helpers
+        private string CredExpr =>
+            $"$sec = ConvertTo-SecureString '{_opt.ServicePassword.Replace("'", "''")}' -AsPlainText -Force; " +
+            $"$cred = New-Object System.Management.Automation.PSCredential('{_opt.ServiceUserUPN}', $sec);";
 
-        public Task<List<OUVm>> GetOUsAsync(string? q, int skip, int take)
+        private string ServerExpr => string.IsNullOrWhiteSpace(_opt.DomainController) ? "" : $" -Server {_opt.DomainController}";
+        private string CommonCred  => $"{CredExpr} ";
+
+        // ----------------- OUs -----------------
+        public async Task<List<OUVm>> GetOUsAsync(string? parentDn, int page, int pageSize)
         {
-            return Task.Run(() =>
+            try
             {
-                var script = @"
-param($BaseDN, $FilterText)
-$ous = Get-ADOrganizationalUnit -LDAPFilter '(objectClass=organizationalUnit)' -SearchBase $BaseDN -SearchScope OneLevel -ResultPageSize 1000 -ErrorAction Stop |
-    Select-Object Name, DistinguishedName, @{N='Description';E={(Get-ADOrganizationalUnit $_.DistinguishedName -Properties description).description}}
-if ($FilterText) { $ous = $ous | Where-Object { $_.Name -like ""*$FilterText*"" -or ($_.Description -like ""*$FilterText*"") } }
-$ous
-";
-                var res = PowerShellRunner.Invoke(script, new Dictionary<string, object?>
-                {
-                    ["BaseDN"] = _baseDn,
-                    ["FilterText"] = q ?? ""
-                });
+                string baseDn = string.IsNullOrWhiteSpace(parentDn) ? _opt.BaseDN : parentDn;
+                string script =
+                    CommonCred +
+                    $"Import-Module ActiveDirectory; " +
+                    $"Get-ADOrganizationalUnit -Filter * -SearchBase '{baseDn}' -ResultSetSize {pageSize}{ServerExpr} -Credential $cred | " +
+                    "Select-Object Name, DistinguishedName";
 
-                var list = res.Select(o => new OUVm
-                {
-                    Name = PowerShellRunner.GetProp<string>(o, "Name", ""),
-                    DistinguishedName = PowerShellRunner.GetProp<string>(o, "DistinguishedName", ""),
-                    Description = PowerShellRunner.GetProp<string>(o, "Description", null)
-                }).Skip(skip).Take(take).ToList();
-                return list;
-            });
-        }
-
-        public Task<List<OUVm>> GetChildOUsAsync(string? parentDn)
-        {
-            return Task.Run(() =>
-            {
-                var searchBase = string.IsNullOrWhiteSpace(parentDn) ? _baseDn : parentDn;
-                var script = @"
-param($SearchBase)
-Get-ADOrganizationalUnit -LDAPFilter '(objectClass=organizationalUnit)' -SearchBase $SearchBase -SearchScope OneLevel -ResultPageSize 1000 -ErrorAction Stop |
-    Select-Object Name, DistinguishedName, @{N='Description';E={(Get-ADOrganizationalUnit $_.DistinguishedName -Properties description).description}}
-";
-                var res = PowerShellRunner.Invoke(script, new Dictionary<string, object?>
-                {
-                    ["SearchBase"] = searchBase
-                });
-
-                return res.Select(o => new OUVm
-                {
-                    Name = PowerShellRunner.GetProp<string>(o, "Name", ""),
-                    DistinguishedName = PowerShellRunner.GetProp<string>(o, "DistinguishedName", ""),
-                    Description = PowerShellRunner.GetProp<string>(o, "Description", null)
-                }).ToList();
-            });
-        }
-
-        public Task<List<ADObjectVm>> GetOuObjectsAsync(string dn, int skip, int take, string? q)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($Base, $Q)
-$filter = '(|(objectClass=user)(objectClass=group)(objectClass=computer))'
-$objs = Get-ADObject -LDAPFilter $filter -SearchBase $Base -SearchScope Subtree -ResultPageSize 1000 -ErrorAction Stop |
-    Select-Object Name, DistinguishedName, ObjectClass
-if ($Q) { $objs = $objs | Where-Object { $_.Name -like ""*$Q*"" } }
-$objs
-";
-                var res = PowerShellRunner.Invoke(script, new Dictionary<string, object?>
-                {
-                    ["Base"] = string.IsNullOrWhiteSpace(dn) ? _baseDn : dn,
-                    ["Q"] = q ?? ""
-                });
-
-                return res.Skip(skip).Take(take).Select(o => new ADObjectVm
-                {
-                    Name = PowerShellRunner.GetProp<string>(o, "Name", ""),
-                    DistinguishedName = PowerShellRunner.GetProp<string>(o, "DistinguishedName", ""),
-                    ObjectClass = PowerShellRunner.GetProp<string>(o, "ObjectClass", "")
-                }).ToList();
-            });
-        }
-
-        public Task<bool> CreateOUAsync(string parentDn, string name, string? description)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($Parent, $Name, $Desc)
-New-ADOrganizationalUnit -Name $Name -Path $Parent -ProtectedFromAccidentalDeletion:$false -ErrorAction Stop | Out-Null
-if ($Desc) { Set-ADOrganizationalUnit -Identity ""OU=$Name,$Parent"" -Description $Desc -ErrorAction Stop }
-$true
-";
-                PowerShellRunner.Invoke(script, new Dictionary<string, object?>
-                {
-                    ["Parent"] = parentDn, ["Name"] = name, ["Desc"] = description ?? ""
-                });
-                return true;
-            });
-        }
-
-        public Task<bool> DeleteOUAsync(string dn)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($Dn)
-Set-ADOrganizationalUnit -Identity $Dn -ProtectedFromAccidentalDeletion:$false -ErrorAction SilentlyContinue
-Remove-ADOrganizationalUnit -Identity $Dn -Confirm:$false -Recursive -ErrorAction Stop
-$true
-";
-                PowerShellRunner.Invoke(script, new Dictionary<string, object?> { ["Dn"] = dn });
-                return true;
-            });
-        }
-
-        public Task<bool> RenameOUAsync(string dn, string newName)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($Dn, $NewName)
-Rename-ADObject -Identity $Dn -NewName ""OU=$NewName"" -ErrorAction Stop
-$true
-";
-                PowerShellRunner.Invoke(script, new Dictionary<string, object?> { ["Dn"] = dn, ["NewName"] = newName });
-                return true;
-            });
-        }
-
-        public Task<bool> MoveObjectAsync(string dn, string newParentDn)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($Dn, $Parent)
-Move-ADObject -Identity $Dn -TargetPath $Parent -ErrorAction Stop
-$true
-";
-                PowerShellRunner.Invoke(script, new Dictionary<string, object?> { ["Dn"] = dn, ["Parent"] = newParentDn });
-                return true;
-            });
-        }
-
-        public Task<bool> MoveUserBySamAsync(string sam, string newParentDn)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($Sam, $Parent)
-$u = Get-ADUser -Identity $Sam -ErrorAction Stop
-Move-ADObject -Identity $u.DistinguishedName -TargetPath $Parent -ErrorAction Stop
-$true
-";
-                PowerShellRunner.Invoke(script, new Dictionary<string, object?> { ["Sam"] = sam, ["Parent"] = newParentDn });
-                return true;
-            });
-        }
-
-        public Task<ADObjectDetailsVm?> GetObjectDetailsAsync(string dn)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($Dn)
-$o = Get-ADObject -Identity $Dn -Properties * -ErrorAction Stop
-if ($o.ObjectClass -eq 'user') {
-    $u = Get-ADUser -Identity $Dn -Properties displayName,mail,lastLogonTimestamp,userAccountControl,sAMAccountName -ErrorAction Stop
-    [PSCustomObject]@{
-        Name = $u.Name
-        DistinguishedName = $u.DistinguishedName
-        ObjectClass = 'user'
-        SAM = $u.SamAccountName
-        Email = $u.Mail
-        LastLogonUtc = if ($u.lastLogonTimestamp) { [DateTime]::FromFileTimeUtc([Int64]$u.lastLogonTimestamp) } else { $null }
-        Enabled = -not ([bool]($u.userAccountControl -band 2))
-        Description = $u.Description
-        MemberCount = $null
-        MembersSam = $null
-    }
-}
-elseif ($o.ObjectClass -eq 'group') {
-    $g = Get-ADGroup -Identity $Dn -Properties Description,member -ErrorAction Stop
-    $members = @()
-    if ($g.member) {
-        foreach ($m in $g.member) {
-            try {
-                $mu = Get-ADUser -Identity $m -ErrorAction Stop
-                $members += $mu.SamAccountName
-            } catch {}
-        }
-    }
-    [PSCustomObject]@{
-        Name = $g.Name
-        DistinguishedName = $g.DistinguishedName
-        ObjectClass = 'group'
-        SAM = $null
-        Email = $null
-        LastLogonUtc = $null
-        Enabled = $null
-        Description = $g.Description
-        MemberCount = $members.Count
-        MembersSam = $members
-    }
-}
-else {
-    [PSCustomObject]@{
-        Name = $o.Name
-        DistinguishedName = $o.DistinguishedName
-        ObjectClass = $o.ObjectClass
-        SAM = $null
-        Email = $null
-        LastLogonUtc = $null
-        Enabled = $null
-        Description = $o.Description
-        MemberCount = $null
-        MembersSam = $null
-    }
-}
-";
-                var res = PowerShellRunner.Invoke(script, new Dictionary<string, object?> { ["Dn"] = dn });
-                var o = res.FirstOrDefault();
-                if (o == null) return null;
-
-                DateTime? ParseDate(object? v)
-                {
-                    if (v == null) return null;
-                    if (v is DateTime dt) return dt.ToUniversalTime();
-                    if (DateTime.TryParse(v.ToString(), out var d)) return d.ToUniversalTime();
-                    return null;
-                }
-
-                var details = new ADObjectDetailsVm
-                {
-                    Name = PowerShellRunner.GetProp<string>(o, "Name", ""),
-                    DistinguishedName = PowerShellRunner.GetProp<string>(o, "DistinguishedName", ""),
-                    ObjectClass = PowerShellRunner.GetProp<string>(o, "ObjectClass", ""),
-                    SAM = PowerShellRunner.GetProp<string>(o, "SAM", null),
-                    Email = PowerShellRunner.GetProp<string>(o, "Email", null),
-                    LastLogonUtc = ParseDate(o.Properties["LastLogonUtc"]?.Value),
-                    Enabled = PowerShellRunner.GetProp<bool?>(o, "Enabled", null),
-                    Description = PowerShellRunner.GetProp<string>(o, "Description", null),
-                    MemberCount = PowerShellRunner.GetProp<int?>(o, "MemberCount", null),
-                    MembersSam = (o.Properties["MembersSam"]?.Value as System.Collections.IEnumerable)?.Cast<object>().Select(x => x?.ToString() ?? "").Where(s => !string.IsNullOrEmpty(s)).ToList()
-                };
-                return details;
-            });
-        }
-
-        public Task<List<ADUserVm>> GetUsersAsync(string? q, int skip, int take)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($BaseDN, $Q)
-$users = if ($Q) {
-    Get-ADUser -Filter ""(displayName -like '*$Q*' -or SamAccountName -like '*$Q*' -or mail -like '*$Q*')"" -SearchBase $BaseDN -SearchScope Subtree -Properties displayName,mail,lastLogonTimestamp,userAccountControl -ErrorAction Stop
-} else {
-    Get-ADUser -Filter * -SearchBase $BaseDN -SearchScope Subtree -Properties displayName,mail,lastLogonTimestamp,userAccountControl -ErrorAction Stop
-}
-$users | Select-Object @{N='DisplayName';E={$_.DisplayName}}, @{N='SAM';E={$_.SamAccountName}}, @{N='Email';E={$_.Mail}},
-    DistinguishedName, @{N='LastLogonUtc';E={ if ($_.lastLogonTimestamp) { [DateTime]::FromFileTimeUtc([Int64]$_.lastLogonTimestamp) } else { $null } }},
-    @{N='Enabled';E={ -not ([bool]($_.userAccountControl -band 2)) }}
-";
-                var res = PowerShellRunner.Invoke(script, new Dictionary<string, object?>
-                {
-                    ["BaseDN"] = _baseDn,
-                    ["Q"] = q ?? ""
-                });
-
-                return res.Skip(skip).Take(take).Select(o => new ADUserVm
-                {
-                    DisplayName = PowerShellRunner.GetProp<string>(o, "DisplayName", ""),
-                    SAM = PowerShellRunner.GetProp<string>(o, "SAM", ""),
-                    Email = PowerShellRunner.GetProp<string>(o, "Email", ""),
-                    DistinguishedName = PowerShellRunner.GetProp<string>(o, "DistinguishedName", ""),
-                    LastLogonUtc = (o.Properties["LastLogonUtc"]?.Value as DateTime?)?.ToUniversalTime(),
-                    Enabled = PowerShellRunner.GetProp<bool>(o, "Enabled", false)
-                }).ToList();
-            });
-        }
-
-        public Task<ADUserVm?> GetUserAsync(string sam)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($Sam)
-$u = Get-ADUser -Identity $Sam -Properties displayName,mail,lastLogonTimestamp,userAccountControl -ErrorAction Stop
-[PSCustomObject]@{
-    DisplayName = $u.DisplayName
-    SAM = $u.SamAccountName
-    Email = $u.Mail
-    DistinguishedName = $u.DistinguishedName
-    LastLogonUtc = if ($u.lastLogonTimestamp) { [DateTime]::FromFileTimeUtc([Int64]$u.lastLogonTimestamp) } else { $null }
-    Enabled = -not ([bool]($u.userAccountControl -band 2))
-}
-";
-                var res = PowerShellRunner.Invoke(script, new Dictionary<string, object?> { ["Sam"] = sam });
-                var o = res.FirstOrDefault();
-                if (o == null) return null;
-                return new ADUserVm
-                {
-                    DisplayName = PowerShellRunner.GetProp<string>(o, "DisplayName", ""),
-                    SAM = PowerShellRunner.GetProp<string>(o, "SAM", ""),
-                    Email = PowerShellRunner.GetProp<string>(o, "Email", ""),
-                    DistinguishedName = PowerShellRunner.GetProp<string>(o, "DistinguishedName", ""),
-                    LastLogonUtc = (o.Properties["LastLogonUtc"]?.Value as DateTime?)?.ToUniversalTime(),
-                    Enabled = PowerShellRunner.GetProp<bool>(o, "Enabled", false)
-                };
-            });
-        }
-
-        public Task<bool> SetUserEnabledAsync(string sam, bool enabled)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($Sam, $Enabled)
-if ($Enabled) { Enable-ADAccount -Identity $Sam -ErrorAction Stop } else { Disable-ADAccount -Identity $Sam -ErrorAction Stop }
-$true
-";
-                PowerShellRunner.Invoke(script, new Dictionary<string, object?> { ["Sam"] = sam, ["Enabled"] = enabled });
-                return true;
-            });
-        }
-
-        public Task<bool> ResetPasswordWithOptionsAsync(string sam, string newPassword, bool forceChange, bool unlock)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($Sam, $Pwd, $ForceChange, $Unlock)
-Set-ADAccountPassword -Identity $Sam -Reset -NewPassword (ConvertTo-SecureString $Pwd -AsPlainText -Force) -ErrorAction Stop
-if ($ForceChange) { Set-ADUser -Identity $Sam -ChangePasswordAtLogon $true -ErrorAction Stop }
-if ($Unlock) { Unlock-ADAccount -Identity $Sam -ErrorAction SilentlyContinue }
-$true
-";
-                PowerShellRunner.Invoke(script, new Dictionary<string, object?>
-                {
-                    ["Sam"] = sam, ["Pwd"] = newPassword, ["ForceChange"] = forceChange, ["Unlock"] = unlock
-                });
-                return true;
-            });
-        }
-
-        public Task<bool> ResetPasswordAsync(string sam, string newPassword)
-            => ResetPasswordWithOptionsAsync(sam, newPassword, false, false);
-
-        public Task<bool> UnlockUserAsync(string sam)
-            => ResetPasswordWithOptionsAsync(sam, "dummy", false, true);
-
-        public Task<List<ADUserVm>> GetUsersAdvancedAsync(UsersQueryOptions options)
-            => GetUsersAsync(options?.Query, options?.Skip ?? 0, options?.Take ?? 50);
-
-        public Task<ADObjectDetailsVm?> GetUserDetailsAsync(string? sam, string? dn)
-        {
-            if (!string.IsNullOrWhiteSpace(dn)) return GetObjectDetailsAsync(dn!);
-            if (!string.IsNullOrWhiteSpace(sam))
-            {
-                return Task.Run(async () =>
-                {
-                    var u = await GetUserAsync(sam!);
-                    if (u == null) return null;
-                    return new ADObjectDetailsVm
-                    {
-                        Name = u.DisplayName ?? u.SAM,
-                        DistinguishedName = u.DistinguishedName,
-                        ObjectClass = "user",
-                        SAM = u.SAM,
-                        Email = u.Email,
-                        LastLogonUtc = u.LastLogonUtc,
-                        Enabled = u.Enabled
-                    };
-                });
+                var result = await _ps.Invoke(script);
+                return result.Select(o => new OUVm(
+                    PowerShellRunner.GetProp<string>(o, "Name") ?? "",
+                    PowerShellRunner.GetProp<string>(o, "DistinguishedName") ?? "",
+                    true
+                )).ToList();
             }
-            return Task.FromResult<ADObjectDetailsVm?>(null);
+            catch (Exception ex)
+            {
+                // إرجاع قائمة فارغة بدلاً من رمي الاستثناء
+                Console.WriteLine($"Error getting OUs: {ex.Message}");
+                return new List<OUVm>();
+            }
         }
 
-        public Task<List<ADGroupVm>> GetGroupsAsync(string? q, int skip, int take)
+        public Task<List<OUVm>> GetChildOUsAsync(string? parentDn) => GetOUsAsync(parentDn, 1, 1000);
+
+        public async Task<(List<ADObjectVm> Items, int Total)> GetOuObjectsAsync(string ouDn, int page, int pageSize)
         {
-            return Task.Run(() =>
+            try
             {
-                var script = @"
-param($BaseDN, $Q)
-$groups = if ($Q) {
-    Get-ADGroup -Filter ""(Name -like '*$Q*' -or SamAccountName -like '*$Q*')"" -SearchBase $BaseDN -SearchScope Subtree -Properties description,member -ErrorAction Stop
-} else {
-    Get-ADGroup -Filter * -SearchBase $BaseDN -SearchScope Subtree -Properties description,member -ErrorAction Stop
-}
-$groups | Select-Object @{N='Name';E={$_.Name}}, @{N='SAM';E={$_.SamAccountName}}, DistinguishedName, @{N='Description';E={$_.Description}}, @{N='MemberCount';E={($_.member | Measure-Object).Count}}
-";
-                var res = PowerShellRunner.Invoke(script, new Dictionary<string, object?>
+                string sb = string.IsNullOrWhiteSpace(ouDn) ? _opt.BaseDN : ouDn;
+                string script =
+                    CommonCred +
+                    "Import-Module ActiveDirectory; " +
+                    // Users + Groups (ممكن تضيف Computers لو تحتاج)
+                    $"$u = Get-ADUser -Filter * -SearchBase '{sb}' -ResultSetSize {pageSize}{ServerExpr} -Credential $cred -Properties * | " +
+                    "Select-Object Name, DistinguishedName,@{n='ObjectClass';e={'user'}}; " +
+                    $"$g = Get-ADGroup -Filter * -SearchBase '{sb}' -ResultSetSize {pageSize}{ServerExpr} -Credential $cred -Properties * | " +
+                    "Select-Object Name, DistinguishedName,@{n='ObjectClass';e={'group'}}; " +
+                    "$u + $g";
+
+                var result = await _ps.Invoke(script);
+                var items = result.Select(o => new ADObjectVm(
+                    PowerShellRunner.GetProp<string>(o, "Name") ?? "",
+                    PowerShellRunner.GetProp<string>(o, "DistinguishedName") ?? "",
+                    PowerShellRunner.GetProp<string>(o, "ObjectClass") ?? ""
+                )).ToList();
+
+                return (items, items.Count);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error getting OU objects: {ex.Message}");
+                return (new List<ADObjectVm>(), 0);
+            }
+        }
+
+        public async Task CreateOUAsync(string parentDn, string name)
+        {
+            string script =
+                CommonCred +
+                "Import-Module ActiveDirectory; " +
+                $"New-ADOrganizationalUnit -Name '{name}' -Path '{parentDn}'{ServerExpr} -Credential $cred";
+            await _ps.Invoke(script);
+        }
+
+        public async Task DeleteOUAsync(string dn)
+        {
+            string script =
+                CommonCred +
+                "Import-Module ActiveDirectory; " +
+                $"Remove-ADOrganizationalUnit -Identity '{dn}' -Confirm:$false{ServerExpr} -Credential $cred";
+            await _ps.Invoke(script);
+        }
+
+        public async Task RenameOUAsync(string dn, string newName)
+        {
+            string script =
+                CommonCred +
+                "Import-Module ActiveDirectory; " +
+                $"Rename-ADObject -Identity '{dn}' -NewName '{newName}'{ServerExpr} -Credential $cred";
+            await _ps.Invoke(script);
+        }
+
+        public async Task MoveObjectAsync(string objectDn, string targetOuDn)
+        {
+            string script =
+                CommonCred +
+                "Import-Module ActiveDirectory; " +
+                $"Move-ADObject -Identity '{objectDn}' -TargetPath '{targetOuDn}'{ServerExpr} -Credential $cred";
+            await _ps.Invoke(script);
+        }
+
+        public async Task MoveUserBySamAsync(string sam, string targetOuDn)
+        {
+            string script =
+                CommonCred +
+                "Import-Module ActiveDirectory; " +
+                $"$u = Get-ADUser -Identity '{sam}'{ServerExpr} -Credential $cred; " +
+                "if ($u) { " +
+                    $"Move-ADObject -Identity $u.DistinguishedName -TargetPath '{targetOuDn}'{ServerExpr} -Credential $cred; " +
+                "}";
+            await _ps.Invoke(script);
+        }
+
+        // ------------- Generic object -------------
+        public async Task<ADObjectDetailsVm?> GetObjectDetailsAsync(string dn)
+        {
+            string script =
+                CommonCred +
+                "Import-Module ActiveDirectory; " +
+                $"Get-ADObject -Identity '{dn}' -Properties *{ServerExpr} -Credential $cred";
+            var r = await _ps.Invoke(script);
+            var o = r.FirstOrDefault();
+            if (o == null) return null;
+
+            var details = new ADObjectDetailsVm { DistinguishedName = dn };
+            var dict = new Dictionary<string, List<string>>();
+            foreach (var p in o.Properties)
+            {
+                var key = p.Name;
+                var vals = new List<string>();
+                foreach (var v in p.Value is System.Collections.IEnumerable en && p.Value is not string
+                         ? en.Cast<object>() : new[] { p.Value })
                 {
-                    ["BaseDN"] = _baseDn, ["Q"] = q ?? ""
-                });
+                    if (v != null) vals.Add(v.ToString()!);
+                }
+                dict[key] = vals;
+            }
+            details.Attributes = dict;
+            return details;
+        }
 
-                return res.Skip(skip).Take(take).Select(o => new ADGroupVm
+        // ---------------- Users ----------------
+        public async Task<(List<ADUserVm> Items, int Total)> GetUsersAsync(string? search, int page, int pageSize)
+        {
+            try
+            {
+                string filter;
+                if (string.IsNullOrWhiteSpace(search))
                 {
-                    Name = PowerShellRunner.GetProp<string>(o, "Name", ""),
-                    SAM = PowerShellRunner.GetProp<string>(o, "SAM", ""),
-                    DistinguishedName = PowerShellRunner.GetProp<string>(o, "DistinguishedName", ""),
-                    Description = PowerShellRunner.GetProp<string>(o, "Description", null),
-                    MemberCount = PowerShellRunner.GetProp<int>(o, "MemberCount", 0)
-                }).ToList();
-            });
-        }
-
-        public Task<List<ADUserVm>> GetGroupMembersAsync(string groupSam)
-        {
-            return Task.Run(() =>
-            {
-                var script = @"
-param($Sam)
-Get-ADGroupMember -Identity $Sam -Recursive -ErrorAction Stop |
-    Where-Object { $_.ObjectClass -eq 'user' } |
-    ForEach-Object {
-        $u = Get-ADUser -Identity $_.DistinguishedName -Properties displayName,mail,lastLogonTimestamp,userAccountControl,SamAccountName
-        [PSCustomObject]@{
-            DisplayName = $u.DisplayName
-            SAM = $u.SamAccountName
-            Email = $u.Mail
-            DistinguishedName = $u.DistinguishedName
-            LastLogonUtc = if ($u.lastLogonTimestamp) { [DateTime]::FromFileTimeUtc([Int64]$u.lastLogonTimestamp) } else { $null }
-            Enabled = -not ([bool]($u.userAccountControl -band 2))
-        }
-    }
-";
-                var res = PowerShellRunner.Invoke(script, new Dictionary<string, object?> { ["Sam"] = groupSam });
-                return res.Select(o => new ADUserVm
+                    filter = "*";
+                }
+                else
                 {
-                    DisplayName = PowerShellRunner.GetProp<string>(o, "DisplayName", ""),
-                    SAM = PowerShellRunner.GetProp<string>(o, "SAM", ""),
-                    Email = PowerShellRunner.GetProp<string>(o, "Email", ""),
-                    DistinguishedName = PowerShellRunner.GetProp<string>(o, "DistinguishedName", ""),
-                    LastLogonUtc = (o.Properties["LastLogonUtc"]?.Value as DateTime?)?.ToUniversalTime(),
-                    Enabled = PowerShellRunner.GetProp<bool>(o, "Enabled", false)
-                }).ToList();
-            });
+                    // البحث في displayName, samAccountName, userPrincipalName
+                    filter = $"(displayName -like '*{search}*' -or samAccountName -like '*{search}*' -or userPrincipalName -like '*{search}*')";
+                }
+                
+                string script =
+                    CommonCred +
+                    "Import-Module ActiveDirectory; " +
+                    $"Get-ADUser -Filter \"{filter}\" -SearchBase '{_opt.BaseDN}' -ResultSetSize {pageSize}{ServerExpr} -Credential $cred -Properties userPrincipalName,displayName,enabled,lockedout | " +
+                    "Select-Object SamAccountName, userPrincipalName, displayName, enabled, lockedout";
+
+                var result = await _ps.Invoke(script);
+                var items = result.Select(o => new ADUserVm(
+                    PowerShellRunner.GetProp<string>(o, "SamAccountName") ?? "",
+                    PowerShellRunner.GetProp<string>(o, "userPrincipalName") ?? "",
+                    PowerShellRunner.GetProp<string>(o, "displayName") ?? "",
+                    PowerShellRunner.GetProp<bool>(o, "enabled"),
+                    PowerShellRunner.GetProp<bool>(o, "lockedout")
+                )).ToList();
+
+                return (items, items.Count);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error getting users: {ex.Message}");
+                return (new List<ADUserVm>(), 0);
+            }
         }
 
-        public Task<bool> AddUserToGroupAsync(string userSam, string groupSam)
+        public async Task<(List<ADUserVm> Items, int Total)> GetUsersAdvancedAsync(UsersQueryOptions options)
         {
-            return Task.Run(() =>
+            try
             {
-                var script = @"
-param($UserSam, $GroupSam)
-Add-ADGroupMember -Identity $GroupSam -Members $UserSam -ErrorAction Stop
-$true
-";
-                PowerShellRunner.Invoke(script, new Dictionary<string, object?> { ["UserSam"] = userSam, ["GroupSam"] = groupSam });
-                return true;
-            });
+                string filter = "*";
+                
+                // بناء الفلتر بناءً على المعايير
+                var conditions = new List<string>();
+                
+                if (!string.IsNullOrWhiteSpace(options.Search))
+                {
+                    conditions.Add($"(displayName -like '*{options.Search}*' -or samAccountName -like '*{options.Search}*' -or userPrincipalName -like '*{options.Search}*')");
+                }
+                
+                if (options.Enabled.HasValue)
+                {
+                    conditions.Add($"enabled -eq {options.Enabled.Value.ToString().ToLower()}");
+                }
+                
+                if (options.Locked.HasValue)
+                {
+                    conditions.Add($"lockedout -eq {options.Locked.Value.ToString().ToLower()}");
+                }
+                
+                if (conditions.Count > 0)
+                {
+                    filter = string.Join(" -and ", conditions);
+                }
+                
+                string searchBase = string.IsNullOrWhiteSpace(options.OuDistinguishedName) ? _opt.BaseDN : options.OuDistinguishedName;
+                
+                string script =
+                    CommonCred +
+                    "Import-Module ActiveDirectory; " +
+                    $"Get-ADUser -Filter \"{filter}\" -SearchBase '{searchBase}' -ResultSetSize {options.PageSize}{ServerExpr} -Credential $cred -Properties userPrincipalName,displayName,enabled,lockedout | " +
+                    "Select-Object SamAccountName, userPrincipalName, displayName, enabled, lockedout";
+
+                var result = await _ps.Invoke(script);
+                var items = result.Select(o => new ADUserVm(
+                    PowerShellRunner.GetProp<string>(o, "SamAccountName") ?? "",
+                    PowerShellRunner.GetProp<string>(o, "userPrincipalName") ?? "",
+                    PowerShellRunner.GetProp<string>(o, "displayName") ?? "",
+                    PowerShellRunner.GetProp<bool>(o, "enabled"),
+                    PowerShellRunner.GetProp<bool>(o, "lockedout")
+                )).ToList();
+
+                return (items, items.Count);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error getting users advanced: {ex.Message}");
+                return (new List<ADUserVm>(), 0);
+            }
         }
 
-        public Task<bool> RemoveUserFromGroupAsync(string userSam, string groupSam)
+        public async Task<ADUserVm?> GetUserAsync(string? samOrUpn)
         {
-            return Task.Run(() =>
+            if (string.IsNullOrWhiteSpace(samOrUpn)) return null;
+            string script =
+                CommonCred +
+                "Import-Module ActiveDirectory; " +
+                $"Get-ADUser -Identity '{samOrUpn}'{ServerExpr} -Credential $cred -Properties userPrincipalName,displayName,enabled,lockedout | " +
+                "Select-Object SamAccountName, userPrincipalName, displayName, enabled, lockedout";
+            var r = await _ps.Invoke(script);
+            var o = r.FirstOrDefault();
+            if (o == null) return null;
+
+            return new ADUserVm(
+                PowerShellRunner.GetProp<string>(o, "SamAccountName") ?? "",
+                PowerShellRunner.GetProp<string>(o, "userPrincipalName") ?? "",
+                PowerShellRunner.GetProp<string>(o, "displayName") ?? "",
+                PowerShellRunner.GetProp<bool>(o, "enabled"),
+                PowerShellRunner.GetProp<bool>(o, "lockedout")
+            );
+        }
+
+        public async Task<ADObjectDetailsVm?> GetUserDetailsAsync(string? sam, string? upn)
+        {
+            if (string.IsNullOrWhiteSpace(sam) && string.IsNullOrWhiteSpace(upn))
+                return null;
+
+            string identity = sam ?? upn!;
+            string script =
+                CommonCred +
+                "Import-Module ActiveDirectory; " +
+                $"$user = Get-ADUser -Identity '{identity}'{ServerExpr} -Credential $cred -Properties *; " +
+                "$groups = Get-ADPrincipalGroupMembership -Identity $user{ServerExpr} -Credential $cred | Select-Object Name, DistinguishedName; " +
+                "$user | Select-Object @{n='Name';e={$_.Name}}, @{n='DisplayName';e={$_.DisplayName}}, @{n='SamAccountName';e={$_.SamAccountName}}, @{n='UserPrincipalName';e={$_.UserPrincipalName}}, @{n='EmailAddress';e={$_.EmailAddress}}, @{n='Enabled';e={$_.Enabled}}, @{n='LockedOut';e={$_.LockedOut}}, @{n='LastLogonDate';e={$_.LastLogonDate}}, @{n='PasswordLastSet';e={$_.PasswordLastSet}}, @{n='AccountExpirationDate';e={$_.AccountExpirationDate}}, @{n='DistinguishedName';e={$_.DistinguishedName}}, @{n='Groups';e={$groups}}";
+
+            var result = await _ps.Invoke(script);
+            var user = result.FirstOrDefault();
+            if (user == null) return null;
+
+            var details = new ADObjectDetailsVm
             {
-                var script = @"
-param($UserSam, $GroupSam)
-Remove-ADGroupMember -Identity $GroupSam -Members $UserSam -Confirm:$false -ErrorAction Stop
-$true
-";
-                PowerShellRunner.Invoke(script, new Dictionary<string, object?> { ["UserSam"] = userSam, ["GroupSam"] = groupSam });
-                return true;
-            });
+                Name = PowerShellRunner.GetProp<string>(user, "Name") ?? "",
+                DisplayName = PowerShellRunner.GetProp<string>(user, "DisplayName") ?? "",
+                SamAccountName = PowerShellRunner.GetProp<string>(user, "SamAccountName") ?? "",
+                Email = PowerShellRunner.GetProp<string>(user, "EmailAddress") ?? "",
+                Enabled = PowerShellRunner.GetProp<bool>(user, "Enabled"),
+                Locked = PowerShellRunner.GetProp<bool>(user, "LockedOut"),
+                DistinguishedName = PowerShellRunner.GetProp<string>(user, "DistinguishedName") ?? "",
+                ObjectClass = "user"
+            };
+
+            // إضافة المعلومات الإضافية
+            var lastLogon = PowerShellRunner.GetProp<DateTime?>(user, "LastLogonDate");
+            if (lastLogon.HasValue)
+                details.LastLogonUtc = lastLogon.Value;
+
+            var passwordLastSet = PowerShellRunner.GetProp<DateTime?>(user, "PasswordLastSet");
+            if (passwordLastSet.HasValue)
+                details.Extra["PasswordLastSet"] = passwordLastSet.Value.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+            var accountExpires = PowerShellRunner.GetProp<DateTime?>(user, "AccountExpirationDate");
+            if (accountExpires.HasValue)
+                details.Extra["AccountExpirationDate"] = accountExpires.Value.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+            // إضافة OU Path
+            var dn = details.DistinguishedName;
+            if (!string.IsNullOrEmpty(dn))
+            {
+                var ouPath = string.Join(" > ", dn.Split(',').Where(p => p.StartsWith("OU=")).Select(p => p.Substring(3)).Reverse());
+                details.Extra["OUPath"] = ouPath;
+            }
+
+            // إضافة Groups
+            var groups = PowerShellRunner.GetProp<object[]>(user, "Groups");
+            if (groups != null && groups.Length > 0)
+            {
+                var groupNames = groups.Select(g => PowerShellRunner.GetProp<string>((PSObject)g, "Name")).Where(n => !string.IsNullOrEmpty(n)).ToArray();
+                details.Extra["Groups"] = groupNames;
+            }
+
+            return details;
+        }
+
+        public async Task SetUserEnabledAsync(string sam, bool enabled)
+        {
+            string cmd = enabled ? "Enable-ADAccount" : "Disable-ADAccount";
+            string script = CommonCred + "Import-Module ActiveDirectory; " +
+                            $"{cmd} -Identity '{sam}'{ServerExpr} -Credential $cred";
+            await _ps.Invoke(script);
+        }
+
+        public async Task ResetPasswordWithOptionsAsync(string sam, string newPassword, bool unlock, bool mustChange)
+        {
+            string script =
+                CommonCred +
+                "Import-Module ActiveDirectory; " +
+                $"Set-ADAccountPassword -Identity '{sam}' -Reset -NewPassword (ConvertTo-SecureString '{newPassword.Replace("'", "''")}' -AsPlainText -Force){ServerExpr} -Credential $cred; " +
+                (unlock ? $"Unlock-ADAccount -Identity '{sam}'{ServerExpr} -Credential $cred; " : "") +
+                (mustChange ? $"Set-ADUser -Identity '{sam}' -ChangePasswordAtLogon $true{ServerExpr} -Credential $cred; " : "");
+            await _ps.Invoke(script);
+        }
+
+        public Task ResetPasswordAsync(string sam, string newPassword)
+            => ResetPasswordWithOptionsAsync(sam, newPassword, unlock: false, mustChange: false);
+
+        public async Task UnlockUserAsync(string sam)
+        {
+            string script =
+                CommonCred + "Import-Module ActiveDirectory; " +
+                $"Unlock-ADAccount -Identity '{sam}'{ServerExpr} -Credential $cred";
+            await _ps.Invoke(script);
+        }
+
+        // --------------- Groups ----------------
+        public async Task<(List<ADGroupVm> Items, int Total)> GetGroupsAsync(string? search, int page, int pageSize)
+        {
+            try
+            {
+                string filter = string.IsNullOrWhiteSpace(search) ? "*" : $"*{search}*";
+                string script =
+                    CommonCred + "Import-Module ActiveDirectory; " +
+                    $"Get-ADGroup -Filter \"name -like '{filter}'\" -SearchBase '{_opt.BaseDN}' -ResultSetSize {pageSize}{ServerExpr} -Credential $cred | " +
+                    "Select-Object Name, DistinguishedName";
+
+                var r = await _ps.Invoke(script);
+                var items = r.Select(o => new ADGroupVm(
+                    PowerShellRunner.GetProp<string>(o, "Name") ?? "",
+                    PowerShellRunner.GetProp<string>(o, "DistinguishedName") ?? ""
+                )).ToList();
+
+                return (items, items.Count);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error getting groups: {ex.Message}");
+                return (new List<ADGroupVm>(), 0);
+            }
+        }
+
+        public async Task<List<ADUserVm>> GetGroupMembersAsync(string groupSamOrDn)
+        {
+            string script =
+                CommonCred + "Import-Module ActiveDirectory; " +
+                $"Get-ADGroupMember -Identity '{groupSamOrDn}'{ServerExpr} -Credential $cred | " +
+                "Where-Object {$_.objectClass -eq 'user'} | " +
+                "Get-ADUser -Properties userPrincipalName,displayName,enabled,lockedout | " +
+                "Select-Object SamAccountName, userPrincipalName, displayName, enabled, lockedout";
+
+            var r = await _ps.Invoke(script);
+            return r.Select(o => new ADUserVm(
+                PowerShellRunner.GetProp<string>(o, "SamAccountName") ?? "",
+                PowerShellRunner.GetProp<string>(o, "userPrincipalName") ?? "",
+                PowerShellRunner.GetProp<string>(o, "displayName") ?? "",
+                PowerShellRunner.GetProp<bool>(o, "enabled"),
+                PowerShellRunner.GetProp<bool>(o, "lockedout")
+            )).ToList();
+        }
+
+        public async Task AddUserToGroupAsync(string userSam, string groupSamOrDn)
+        {
+            string script =
+                CommonCred + "Import-Module ActiveDirectory; " +
+                $"Add-ADGroupMember -Identity '{groupSamOrDn}' -Members '{userSam}'{ServerExpr} -Credential $cred";
+            await _ps.Invoke(script);
+        }
+
+        public async Task RemoveUserFromGroupAsync(string userSam, string groupSamOrDn)
+        {
+            string script =
+                CommonCred + "Import-Module ActiveDirectory; " +
+                $"Remove-ADGroupMember -Identity '{groupSamOrDn}' -Members '{userSam}' -Confirm:$false{ServerExpr} -Credential $cred";
+            await _ps.Invoke(script);
         }
     }
 }

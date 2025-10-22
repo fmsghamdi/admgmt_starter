@@ -1,90 +1,36 @@
 using admgmt_backend.Services;
-using System.Text.Json;
-using Microsoft.AspNetCore.Mvc;
-//using Backend.Services; 
-
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ==========================
-// 🔹 الإعدادات العامة
-// ==========================
-var config = builder.Configuration;
+// Controllers + CORS
+builder.Services.AddControllers();
+builder.Services.AddCors(p => p.AddDefaultPolicy(x => x.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 
-// السماح بعدة عناوين Frontend (مثلاً 5173 و 5174)
-var frontOrigins = config.GetSection("Frontend:Origins").Get<string[]>()
-                  ?? new[] { config["Frontend:Origin"] ?? "http://localhost:5174" };
+// Bind AD options from appsettings.json
+builder.Services.Configure<AdOptions>(builder.Configuration.GetSection("AD"));
 
-// ==========================
-// 🔹 إضافة الخدمات (Dependency Injection)
-// ==========================
-builder.Services.AddControllers()
-    .AddJsonOptions(o =>
-    {
-        // نخلي الإخراج بصيغة camelCase عشان يطابق أسماء الخصائص في الواجهة
-        o.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
-        o.JsonSerializerOptions.DictionaryKeyPolicy = JsonNamingPolicy.CamelCase;
-    });
-
-// Swagger (للتجربة أثناء التطوير)
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
-
-// ==========================
-// 🔹 إعداد سياسة CORS
-// ==========================
-builder.Services.AddCors(options =>
-{
-    options.AddPolicy("frontend", policy =>
-    {
-        policy.WithOrigins(frontOrigins)
-              .AllowAnyHeader()
-              .AllowAnyMethod()
-              .AllowCredentials();
-    });
-});
-
-// ==========================
-// 🔹 تسجيل الخدمات
-// ==========================
-builder.Services.AddSingleton<IPasswordPolicyService, PasswordPolicyService>();
-//builder.Services.AddScoped<IADService, ADService>();
+// DI
+builder.Services.AddSingleton<PowerShellRunner>();
 builder.Services.AddScoped<IADService, PowerShellAdService>();
-
-// (ممكن لاحقًا تضيف مصادقة JWT هنا)
-// builder.Services.AddAuthentication(...);
-// builder.Services.AddAuthorization();
 
 var app = builder.Build();
 
-// ==========================
-// 🔹 Middlewares
-// ==========================
+// Dev exception page + simple error logging
 if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
+    app.UseDeveloperExceptionPage();
 }
-
-// تفعيل سياسة الـ CORS
-app.UseCors("frontend");
-
-// app.UseAuthentication();
-app.UseAuthorization();
-
-// ==========================
-// 🔹 خرائط الـ API
-// ==========================
-app.MapControllers();
-
-// Endpoint صحي للتأكد أن الخدمة تعمل
-app.MapGet("/health", () => Results.Ok(new
+app.Use(async (ctx, next) =>
 {
-    ok = true,
-    env = app.Environment.EnvironmentName
-}));
+    try { await next(); }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[ERR] {ex}");
+        throw;
+    }
+});
 
-// ==========================
-// 🔹 تشغيل التطبيق
-// ==========================
+app.UseCors();
+app.MapControllers();
 app.Run();
