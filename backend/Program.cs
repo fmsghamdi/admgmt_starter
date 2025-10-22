@@ -1,6 +1,8 @@
 using admgmt_backend.Services;
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
+//using Backend.Services; 
+
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -46,7 +48,8 @@ builder.Services.AddCors(options =>
 // 🔹 تسجيل الخدمات
 // ==========================
 builder.Services.AddSingleton<IPasswordPolicyService, PasswordPolicyService>();
-builder.Services.AddScoped<IADService, ADService>();
+//builder.Services.AddScoped<IADService, ADService>();
+builder.Services.AddScoped<IADService, PowerShellAdService>();
 
 // (ممكن لاحقًا تضيف مصادقة JWT هنا)
 // builder.Services.AddAuthentication(...);

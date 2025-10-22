@@ -1,251 +1,100 @@
-// frontend/src/pages/UsersPage.tsx
-import React, { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  Box,
-  Stack,
-  TextField,
-  Button,
-  Typography,
-  IconButton,
-  FormControl,
-  InputLabel,
-  Select,
-  MenuItem,
-} from "@mui/material";
-import SearchIcon from "@mui/icons-material/Search";
-import RefreshIcon from "@mui/icons-material/Refresh";
-import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
-import {
-  DataGrid,
-  GridColDef,
-  GridRenderCellParams,
-  GridPaginationModel,
-  // ملاحظة: لا نستخدم GridValueFormatterParams / GridValueGetterParams
-  // وإن احتجت تايبز: يوجد GridValueFormatter و GridValueGetter في v6
-} from "@mui/x-data-grid";
-import { useSnackbar } from "notistack";
-import UserDetailsModal from "./components/UserDetailsModal";
+import React, { useEffect, useMemo, useState } from "react";
 
-// يضمن إضافة /api حتى لو متغير البيئة ما فيه /api
-const RAW = import.meta.env.VITE_API_URL ?? "http://localhost:5000";
-const API = (RAW.endsWith("/api") ? RAW : RAW.replace(/\/+$/, "") + "/api");
-
-
-/* ================= Types ================= */
-export type ADUserVm = {
-  samAccountName: string;
+type ADUser = {
   displayName: string;
-  email?: string | null;
-  enabled?: boolean | null;
+  sam: string;
+  email: string;
+  distinguishedName: string;
   lastLogonUtc?: string | null;
+  enabled: boolean;
 };
 
-type UsersApiResponse = {
-  items: ADUserVm[];
-  total: number;
-  error?: string;
-};
+const API = import.meta.env.VITE_API_URL ?? "http://localhost:5079";
 
-/* =============== Component =============== */
 export default function UsersPage() {
-  const { enqueueSnackbar } = useSnackbar();
-
-  // البحث والفلاتر
   const [q, setQ] = useState("");
-  const [status, setStatus] = useState<"any" | "enabled" | "disabled" | "locked">("any");
-  const [ouDn, setOuDn] = useState("");
-
-  // الجدول
-  const [rows, setRows] = useState<ADUserVm[]>([]);
-  const [rowCount, setRowCount] = useState(0);
+  const [rows, setRows] = useState<ADUser[]>([]);
   const [loading, setLoading] = useState(false);
-  const [paginationModel, setPaginationModel] = useState<GridPaginationModel>({
-    page: 0,
-    pageSize: 100,
-  });
+  const [take] = useState(100);
+  const [skip] = useState(0);
 
-  // نافذة التفاصيل
-  const [detailsSam, setDetailsSam] = useState<string | null>(null);
-
-  /* -------- الأعمدة -------- */
-  const columns = useMemo<GridColDef<ADUserVm>[]>(
-    () => [
-      {
-        field: "displayName",
-        headerName: "Display Name",
-        flex: 1,
-        minWidth: 220,
-        // لا نستخدم GridValueGetterParams؛ نكتب دالة مباشرة
-        valueGetter: (_value, row) => row.displayName || row.samAccountName || "",
-        renderCell: (p: GridRenderCellParams<ADUserVm, string>) => (
-          <Stack direction="row" alignItems="center" spacing={1} sx={{ width: "100%" }}>
-            <Typography
-              variant="body2"
-              sx={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}
-            >
-              {p.value}
-            </Typography>
-            <IconButton
-              size="small"
-              onClick={(e) => {
-                e.stopPropagation();
-                setDetailsSam(p.row.samAccountName);
-              }}
-              title="User details"
-            >
-              <InfoOutlinedIcon fontSize="small" />
-            </IconButton>
-          </Stack>
-        ),
-      },
-      { field: "samAccountName", headerName: "SAM", flex: 0.7, minWidth: 140 },
-      {
-        field: "email",
-        headerName: "Email",
-        flex: 1,
-        minWidth: 220,
-        // لا نستخدم GridValueFormatterParams
-        valueFormatter: (value) => (value ?? "-") as string,
-      },
-      {
-        field: "enabled",
-        headerName: "Status",
-        width: 120,
-        type: "boolean",
-        renderCell: (p: GridRenderCellParams<ADUserVm, boolean | null | undefined>) => (
-          <Typography variant="body2">{p.value ? "enabled" : "disabled"}</Typography>
-        ),
-      },
-      {
-        field: "lastLogonUtc",
-        headerName: "Last Logon",
-        width: 180,
-        valueFormatter: (value) =>
-            value ? new Date(String(value)).toLocaleString() : "-",
-      },
-    ],
-    []
-  );
-
-  /* -------- جلب المستخدمين -------- */
-  const fetchUsers = useCallback(async () => {
+  const auth = useMemo(() => {
     try {
-      setLoading(true);
+      const t = localStorage.getItem("token");
+      return t ? { Authorization: `Bearer ${t}` } : {};
+    } catch {
+      return {};
+    }
+  }, []);
 
-      const take = paginationModel.pageSize;
-      const skip = paginationModel.page * paginationModel.pageSize;
-
-      const url = new URL(`${API}/users`);
-      const params = new URLSearchParams();
-      if (q.trim()) params.set("q", q.trim());
-      if (ouDn.trim()) params.set("ouDn", ouDn.trim());
-      if (status !== "any") params.set("status", status);
-      params.set("take", String(take));
-      params.set("skip", String(skip));
-      url.search = params.toString();
-
-      const res = await fetch(url.toString(), { headers: { Accept: "application/json" } });
-      if (!res.ok) throw new Error(`API ${res.status}`);
-
-      const data: UsersApiResponse = await res.json();
-      const items = Array.isArray(data.items) ? data.items : [];
-      const total = Number.isFinite(data.total) ? data.total : items.length;
-
-      setRows(items);
-      setRowCount(total);
-    } catch (err: any) {
-      console.error(err);
-      enqueueSnackbar(`Failed to load users: ${err.message ?? err}`, { variant: "error" });
-      setRows([]);
-      setRowCount(0);
+  const fetchUsers = async () => {
+    setLoading(true);
+    try {
+      const url = `${API}/api/users?q=${encodeURIComponent(q)}&take=${take}&skip=${skip}`;
+      const res = await fetch(url, {
+        headers: {
+          Accept: "application/json",
+          ...(auth.Authorization ? { Authorization: auth.Authorization } : {}),
+        },
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const json = await res.json();
+      setRows(Array.isArray(json) ? json : json.items ?? []);
+    } catch (e: any) {
+      console.error(e);
+      alert(`Failed to load users: ${e.message ?? e}`);
     } finally {
       setLoading(false);
     }
-  }, [API, q, ouDn, status, paginationModel.page, paginationModel.pageSize, enqueueSnackbar]);
-
-  useEffect(() => {
-    fetchUsers();
-  }, [fetchUsers]);
-
-  const onSearchClick = () => {
-    setPaginationModel((prev) => ({ ...prev, page: 0 }));
-    fetchUsers();
   };
 
-  const onRefresh = () => fetchUsers();
+  useEffect(() => {
+    // اختياري: تحميل تلقائي عند فتح الصفحة
+    // fetchUsers();
+  }, []);
 
-  /* --------------- الواجهة --------------- */
   return (
-    <Box sx={{ p: 2 }}>
-      {/* البحث */}
-      <Stack
-        direction={{ xs: "column", md: "row" }}
-        spacing={2}
-        alignItems={{ xs: "stretch", md: "center" }}
-        sx={{ mb: 2 }}
-      >
-        <TextField
-          label="Search users (displayName / SAM / email)"
+    <div className="p-6">
+      <div className="flex gap-3 items-center mb-4">
+        <input
+          className="px-3 py-2 rounded w-full text-black"
+          placeholder="Search users (displayName / SAM / email)"
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          fullWidth
-          size="small"
         />
-
-        <FormControl size="small" sx={{ minWidth: 160 }}>
-          <InputLabel>Status</InputLabel>
-          <Select
-            label="Status"
-            value={status}
-            onChange={(e) => setStatus(e.target.value as any)}
-          >
-            <MenuItem value="any">Any</MenuItem>
-            <MenuItem value="enabled">Enabled</MenuItem>
-            <MenuItem value="disabled">Disabled</MenuItem>
-            <MenuItem value="locked">Locked</MenuItem>
-          </Select>
-        </FormControl>
-
-        <TextField
-          label="OU DN (optional)"
-          value={ouDn}
-          onChange={(e) => setOuDn(e.target.value)}
-          size="small"
-          sx={{ minWidth: 260 }}
-        />
-
-        <Button variant="contained" startIcon={<SearchIcon />} onClick={onSearchClick} sx={{ minWidth: 140 }}>
+        <button onClick={fetchUsers} className="px-4 py-2 rounded bg-purple-600 text-white">
           SEARCH
-        </Button>
+        </button>
+      </div>
 
-        <IconButton onClick={onRefresh} title="Refresh">
-          <RefreshIcon />
-        </IconButton>
-      </Stack>
-
-      {/* الجدول */}
-      <Box sx={{ height: 560 }}>
-        <DataGrid
-          columns={columns}
-          rows={rows}
-          loading={loading}
-          getRowId={(r) => r.samAccountName}
-          paginationMode="server"
-          rowCount={rowCount}
-          paginationModel={paginationModel}
-          onPaginationModelChange={setPaginationModel}
-          pageSizeOptions={[25, 50, 100, 200]}
-          disableRowSelectionOnClick
-          density="compact"
-        />
-      </Box>
-
-      {/* نافذة التفاصيل */}
-      <UserDetailsModal
-        open={!!detailsSam}
-        sam={detailsSam ?? ""}
-        onClose={() => setDetailsSam(null)}
-      />
-    </Box>
+      {loading ? (
+        <div>Loading…</div>
+      ) : rows.length === 0 ? (
+        <div>No rows</div>
+      ) : (
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left">
+              <th className="py-2">Display Name</th>
+              <th>SAM</th>
+              <th>Email</th>
+              <th>Status</th>
+              <th>Last Logon</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((u) => (
+              <tr key={u.distinguishedName} className="border-t border-gray-700">
+                <td className="py-2">{u.displayName}</td>
+                <td>{u.sam}</td>
+                <td>{u.email}</td>
+                <td>{u.enabled ? "Enabled" : "Disabled"}</td>
+                <td>{u.lastLogonUtc ? new Date(u.lastLogonUtc).toLocaleString() : "-"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
   );
 }
